@@ -1,0 +1,26 @@
+# cargo-deny policy. Run with `make audit` (also runs in CI).
+
+[graph]
+all-features = false
+
+[advisories]
+# Any RustSec vulnerability or unsound advisory fails the check. Unmaintained crates are
+# reported for direct dependencies only (transitive ones we cannot replace ourselves).
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# Only crates.io; no git or alternative registries can sneak in.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# License policy is not decided yet (the app is proprietary for now); see ACTIONPLAN.
+# `make audit` runs advisories, bans and sources only.
+allow = []

@@ -1,0 +1,153 @@
+/*
+ * Base styles. The theme variables below are the built-in dark theme (src/desktop/src/theme), so
+ * the first paint matches it; the theme engine replaces them at runtime. A Rust test checks the
+ * two stay in step.
+ */
+:root {
+    --bg: #15171c;
+    --surface: #1d2027;
+    --surface-2: #262a33;
+    --border: #323743;
+    --text: #e3e6ec;
+    --text-muted: #8a91a0;
+    --accent: #5b9cf5;
+    --accent-text: #0b1220;
+    --focus: #8fbaff;
+    --danger: #ef6b6b;
+    --warning: #e5b454;
+    --success: #5cc98a;
+    --graph-1: #5b9cf5;
+    --graph-2: #e0789f;
+    --graph-3: #5cc98a;
+    --graph-4: #e5b454;
+    --graph-5: #a98cf0;
+    --graph-6: #4fc1c9;
+    --graph-7: #ef8f5b;
+    --graph-8: #9aa3b5;
+    color-scheme: dark;
+    font-family:
+        system-ui,
+        -apple-system,
+        "Segoe UI",
+        sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/*
+ * Colors for diffs and syntax highlighting, derived from the theme so every theme gets them.
+ * Shiki's CSS-variables theme reads the --shiki-* names.
+ */
+body {
+    --diff-added: color-mix(in srgb, var(--success) 14%, transparent);
+    --diff-deleted: color-mix(in srgb, var(--danger) 14%, transparent);
+    --code-emphasis: color-mix(in srgb, var(--text) 22%, transparent);
+    --shiki-foreground: var(--text);
+    --shiki-background: transparent;
+    --shiki-token-comment: var(--text-muted);
+    --shiki-token-keyword: var(--graph-5);
+    --shiki-token-string: var(--graph-3);
+    --shiki-token-string-expression: var(--graph-3);
+    --shiki-token-constant: var(--graph-7);
+    --shiki-token-function: var(--graph-1);
+    --shiki-token-parameter: var(--graph-4);
+    --shiki-token-punctuation: var(--text-muted);
+    --shiki-token-link: var(--accent);
+}
+
+button,
+input,
+select {
+    font: inherit;
+}
+
+button {
+    padding: 0.4rem 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    border-color: var(--text-muted);
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--accent-text);
+}
+
+button.danger {
+    border-color: var(--danger);
+    background: var(--danger);
+    color: var(--accent-text);
+}
+
+input,
+select {
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* Drawn here rather than natively: WebKitGTK's native select is taller than the inputs and
+   buttons beside it, and its arrow ignores the theme. */
+select {
+    padding-right: 1.7rem;
+    background-image:
+        linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+        linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+    background-position:
+        calc(100% - 0.95rem) 55%,
+        calc(100% - 0.6rem) 55%;
+    background-size: 0.35rem 0.35rem;
+    background-repeat: no-repeat;
+    cursor: pointer;
+    appearance: none;
+}
+
+select:hover:not(:disabled) {
+    border-color: var(--text-muted);
+}
+
+::placeholder {
+    color: var(--text-muted);
+    opacity: 0.8;
+}
+
+input[aria-invalid="true"] {
+    border-color: var(--danger);
+}
+
+:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
+}
+
+code {
+    font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+    font-size: 0.92em;
+}

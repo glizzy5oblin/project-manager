@@ -1,0 +1,11 @@
+# Build output: build/ui (frontend, Vite) and build/rust (backend, Cargo)
+build/
+node_modules/
+src/desktop/gen/
+
+*.local
+*.log
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
