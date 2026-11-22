@@ -10,6 +10,8 @@
     import type { RepoChanged } from "./lib/bindings/RepoChanged";
     import type { Session } from "./lib/bindings/Session";
     import type { ThemeList } from "./lib/bindings/ThemeList";
+    import ActionDialog from "./lib/components/ActionDialog.svelte";
+    import ContextMenu from "./lib/components/ContextMenu.svelte";
     import ErrorBox from "./lib/components/ErrorBox.svelte";
     import Hub from "./lib/components/Hub.svelte";
     import ProjectTab from "./lib/components/ProjectTab.svelte";
@@ -122,9 +124,9 @@
                 }),
             );
             await initTasks();
-            session = saved;
+            // Tabs wait for the project list: until then they could only show ids ("p1").
             await refresh();
-            session = pruneTabs(session, new Set(projects.map((p) => p.id)));
+            session = pruneTabs(saved, new Set(projects.map((p) => p.id)));
             ready = true;
             api.gitCheck().catch((e) => (gitError = toAppError(e)));
         })().catch((e) => (hubError = toAppError(e)));
@@ -226,6 +228,8 @@
     </main>
     <TaskBar />
 </div>
+<ActionDialog />
+<ContextMenu />
 
 <style>
     .app {

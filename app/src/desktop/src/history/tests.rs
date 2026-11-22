@@ -434,6 +434,31 @@ fn graph_key_changes_with_refs() {
 }
 
 #[test]
+fn graph_key_changes_when_head_moves_to_a_branch_at_the_same_commit() {
+    let r = linear(2);
+    r.git(&["branch", "other"]);
+    let opts = GraphOptions::default();
+    let g = build(r.path(), &opts, 1).unwrap();
+    r.git(&["switch", "-q", "other"]);
+    let key = current_key(r.path(), &opts).unwrap();
+    assert_eq!(key.head, g.key.head, "same commit");
+    assert_ne!(key, g.key, "the graph must rebuild so the HEAD label moves");
+    let g2 = build(r.path(), &opts, 2).unwrap();
+    // Both branches sit on the newest commit, row 0.
+    let head_branch = |g: &super::graph::Graph| {
+        g.labels(0)
+            .iter()
+            .find(|l| l.is_head)
+            .map(|l| l.name.clone())
+    };
+    assert_eq!(head_branch(&g).as_deref(), Some("main"));
+    assert_eq!(head_branch(&g2).as_deref(), Some("other"));
+
+    r.git(&["switch", "-q", "--detach"]);
+    assert_ne!(current_key(r.path(), &opts).unwrap(), key, "detached");
+}
+
+#[test]
 fn graph_find_by_full_and_short_id() {
     let r = merges();
     let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
@@ -944,6 +969,189 @@ fn file_diffs_match_git_diff() {
 }
 
 #[test]
+fn work_stats_count_lines_like_git_numstat() {
+    use super::diff::{WorkSide, work_stats};
+    let r = FixtureRepo::new();
+    let body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+    r.write("story.txt", &body);
+    r.write("gone.txt", "a\nb\nc\n");
+    r.write("bin.dat", "x\0y");
+    r.commit_all("base");
+    r.write("story.txt", body.replace("line 3\n", "three\nextra\n"));
+    r.remove("gone.txt");
+    r.write("bin.dat", "x\0z");
+    r.write("new.txt", "fresh\nfile\n");
+    let repo = open_repo(&r);
+    let files = [
+        ("story.txt".to_string(), WorkSide::Unstaged),
+        ("gone.txt".to_string(), WorkSide::Unstaged),
+        ("bin.dat".to_string(), WorkSide::Unstaged),
+        ("new.txt".to_string(), WorkSide::Unstaged),
+        ("nope.txt".to_string(), WorkSide::Staged),
+    ];
+    let got: Vec<_> = work_stats(&repo, &files)
+        .into_iter()
+        .map(|s| (s.path, s.additions, s.deletions))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("story.txt".to_string(), Some(2), Some(1)),
+            ("gone.txt".to_string(), Some(0), Some(3)),
+            ("bin.dat".to_string(), None, None),
+            ("new.txt".to_string(), Some(2), Some(0)),
+            ("nope.txt".to_string(), None, None),
+        ]
+    );
+}
+
+#[test]
+fn work_diffs_match_git_diff() {
+    use super::diff::{WorkSide, work_diff};
+    let r = FixtureRepo::new();
+    let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    r.write("story.txt", &body);
+    r.write("gone.txt", "bye\n");
+    r.write("staged-gone.txt", "bye too\n");
+    r.write("crlf.txt", "one\ntwo\nthree\n");
+    r.commit_all("base");
+
+    // A staged edit, then a further unstaged edit on top of it.
+    r.write("story.txt", body.replace("line 3\n", "line three\n"));
+    r.git(&["add", "story.txt"]);
+    r.write(
+        "story.txt",
+        body.replace("line 3\n", "line three\n")
+            .replace("line 15\n", "line fifteen\n"),
+    );
+    r.remove("gone.txt");
+    r.git(&["rm", "-q", "staged-gone.txt"]);
+    r.write("new.txt", "fresh\nfile\n");
+    r.write("added.txt", "staged new\n");
+    r.git(&["add", "added.txt"]);
+    let repo = open_repo(&r);
+
+    let check = |path: &str, side: WorkSide, git: &[&str]| {
+        let d = work_diff(&repo, path, side, 3, false).unwrap();
+        assert_eq!(unified(&d.hunks), git_hunks(&r, git), "{path} {side:?}");
+        d
+    };
+    let d = check(
+        "story.txt",
+        WorkSide::Staged,
+        &["--cached", "--", "story.txt"],
+    );
+    assert_eq!(d.status, FileStatus::Modified);
+    check("story.txt", WorkSide::Unstaged, &["--", "story.txt"]);
+    let d = check("gone.txt", WorkSide::Unstaged, &["--", "gone.txt"]);
+    assert_eq!(d.status, FileStatus::Deleted);
+    let d = check(
+        "staged-gone.txt",
+        WorkSide::Staged,
+        &["--cached", "--", "staged-gone.txt"],
+    );
+    assert_eq!(d.status, FileStatus::Deleted);
+    let d = check(
+        "added.txt",
+        WorkSide::Staged,
+        &["--cached", "--", "added.txt"],
+    );
+    assert_eq!(d.status, FileStatus::Added);
+    // Untracked: compared with nothing, as `git diff --no-index /dev/null` would.
+    let d = work_diff(&repo, "new.txt", WorkSide::Unstaged, 3, false).unwrap();
+    assert_eq!(d.status, FileStatus::Added);
+    assert_eq!(unified(&d.hunks), "@@ -0,0 +1,2 @@\n+fresh\n+file\n");
+    assert_eq!((d.old_size, d.new_size), (None, Some(11)));
+
+    // CRLF on disk against LF in the index shows only the real change.
+    r.write("crlf.txt", "one\r\nTWO\r\nthree\r\n");
+    let d = work_diff(&repo, "crlf.txt", WorkSide::Unstaged, 3, false).unwrap();
+    assert_eq!(
+        unified(&d.hunks),
+        "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+    );
+
+    // No change on that side is an empty diff; a file on neither side is an error.
+    let d = work_diff(&repo, "gone.txt", WorkSide::Staged, 3, false).unwrap();
+    assert!(d.hunks.is_empty());
+    assert!(work_diff(&repo, "nope.txt", WorkSide::Unstaged, 3, false).is_err());
+    for bad in ["../outside.txt", ".git/config", "a//b", "/etc/passwd", ""] {
+        assert!(
+            work_diff(&repo, bad, WorkSide::Unstaged, 3, false).is_err(),
+            "{bad:?}"
+        );
+    }
+
+    // Large files need `force`; binary files have no hunks.
+    r.write("big.txt", "x\n".repeat(600 * 1024));
+    let d = work_diff(&repo, "big.txt", WorkSide::Unstaged, 3, false).unwrap();
+    assert!(d.too_large && d.hunks.is_empty());
+    assert_eq!(d.new_size, Some(1200 * 1024));
+    let d = work_diff(&repo, "big.txt", WorkSide::Unstaged, 3, true).unwrap();
+    assert!(!d.too_large && !d.hunks.is_empty());
+    r.write("blob.bin", [0u8, 1, 2]);
+    let d = work_diff(&repo, "blob.bin", WorkSide::Unstaged, 3, false).unwrap();
+    assert!(d.binary && d.hunks.is_empty());
+
+    // A path through a symbolic link is not followed out of the working tree.
+    #[cfg(unix)]
+    {
+        let outside = r.sibling("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, r.path().join("escape")).unwrap();
+        let e = work_diff(&repo, "escape/secret.txt", WorkSide::Unstaged, 3, false).unwrap_err();
+        assert!(e.message.contains("symbolic link"), "{}", e.message);
+        // The link itself shows its target, like git.
+        let d = work_diff(&repo, "escape", WorkSide::Unstaged, 3, false).unwrap();
+        assert_eq!(d.new_mode.as_deref(), Some("120000"));
+    }
+}
+
+#[test]
+fn work_diff_of_a_conflicted_file_shows_the_markers() {
+    use super::diff::{WorkSide, work_diff};
+    let r = conflict();
+    start_conflict(&r);
+    let d = work_diff(&open_repo(&r), "conflict.txt", WorkSide::Unstaged, 3, false).unwrap();
+    let added: Vec<&str> = d.hunks[0]
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Added)
+        .map(|l| l.text.as_str())
+        .collect();
+    assert!(added.iter().any(|l| l.starts_with("<<<<<<<")), "{added:?}");
+    assert!(added.contains(&"topic version"), "{added:?}");
+}
+
+#[test]
+fn word_emphasis_never_covers_indentation() {
+    // Re-indenting a line changes only whitespace: no pale block over it.
+    let hs = hunks(
+        "if (a) {\n    run();\n}\n",
+        "if (a) {\n        run();\n}\n",
+        3,
+    );
+    for l in hs[0].lines.iter().filter(|l| l.kind != LineKind::Context) {
+        assert!(l.emphasis.is_empty(), "{:?} {:?}", l.text, l.emphasis);
+    }
+    // A real change next to new indentation is marked without the spaces around it.
+    let hs = hunks("    foo(1);\n", "        foo(2);\n", 0);
+    for l in hs[0].lines.iter().filter(|l| l.kind != LineKind::Context) {
+        for r in &l.emphasis {
+            let piece: String = l
+                .text
+                .encode_utf16()
+                .skip(r[0] as usize)
+                .take((r[1] - r[0]) as usize)
+                .map(|u| u as u8 as char)
+                .collect();
+            assert_eq!(piece.trim(), piece, "{:?} {:?}", l.text, l.emphasis);
+        }
+    }
+}
+
+#[test]
 fn word_emphasis_marks_only_changed_words() {
     let hs = hunks("let a = 1;\nkeep\n", "let b = 1;\nkeep\n", 3);
     let lines = &hs[0].lines;
@@ -1086,5 +1294,116 @@ fn history_benchmark() {
             hits.rows.len(),
         );
         assert_eq!(first.len(), 200);
+    }
+}
+
+fn branched_at(r: &FixtureRepo) -> Vec<(String, Vec<String>)> {
+    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    g.rows(0, g.len() as u32)
+        .unwrap()
+        .into_iter()
+        .filter(|row| !row.branched.is_empty())
+        .map(|row| (row.id, row.branched.into_iter().map(|b| b.name).collect()))
+        .collect()
+}
+
+#[test]
+fn a_branch_made_from_a_branch_that_has_not_moved_marks_where_it_branched() {
+    let r = linear(2);
+    r.git(&["branch", "-M", "main"]);
+    let fork = r.rev("HEAD");
+    r.git(&["switch", "-q", "-c", "dev"]);
+    r.commit_file("a.txt", "a\n", "on dev 1");
+    r.commit_file("b.txt", "b\n", "on dev 2");
+    assert_eq!(branched_at(&r), vec![(fork, vec!["dev".to_string()])]);
+}
+
+#[test]
+fn no_branch_point_when_the_branches_share_a_tip_or_never_meet() {
+    // Two branches on one commit: nothing branched yet.
+    let r = linear(2);
+    r.git(&["branch", "other"]);
+    assert_eq!(branched_at(&r), vec![]);
+    // A branch with nothing else below it.
+    let r = linear(3);
+    assert_eq!(branched_at(&r), vec![]);
+}
+
+#[test]
+fn a_remote_branch_of_the_same_name_is_not_another_branch() {
+    let r = linear(3);
+    r.git(&["branch", "-M", "main"]);
+    // origin/main at HEAD~1 is main's own remote copy, so main branched from nowhere.
+    r.git(&["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    assert_eq!(branched_at(&r), vec![]);
+    // origin/other at HEAD~1 is another branch's: main branched from there.
+    r.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    r.git(&["update-ref", "refs/remotes/origin/other", "HEAD~1"]);
+    assert_eq!(
+        branched_at(&r),
+        vec![(r.rev("HEAD~1"), vec!["main".to_string()])]
+    );
+}
+
+#[test]
+fn no_branch_point_once_the_branches_have_diverged() {
+    // The graph draws two lanes there, so no extra mark is needed.
+    let r = linear(2);
+    r.git(&["branch", "-M", "main"]);
+    r.git(&["switch", "-q", "-c", "dev"]);
+    r.commit_file("a.txt", "a\n", "on dev");
+    r.git(&["switch", "-q", "main"]);
+    r.commit_file("m.txt", "m\n", "on main");
+    assert_eq!(branched_at(&r), vec![]);
+}
+
+#[test]
+fn a_branch_point_gives_the_branch_its_own_colour_on_the_shared_lane() {
+    let r = linear(2);
+    r.git(&["branch", "-M", "main"]);
+    r.git(&["switch", "-q", "-c", "dev"]);
+    r.commit_file("a.txt", "a\n", "on dev 1");
+    r.commit_file("b.txt", "b\n", "on dev 2");
+    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let rows = g.rows(0, g.len() as u32).unwrap();
+    // dev 2, dev 1, main (the branch point), first commit.
+    assert!(rows.iter().all(|row| row.lane == 0), "one lane");
+    assert_eq!(rows[0].color, rows[1].color, "dev's commits share a colour");
+    assert_ne!(rows[1].color, rows[2].color, "main has another one");
+    assert_eq!(rows[2].color, 0, "main is colour 0");
+    assert_eq!(rows[3].color, 0, "and so is its history below");
+    assert_ne!(rows[0].color, 0, "no other branch takes colour 0");
+    assert_eq!(
+        rows[2].branched[0].color, rows[0].color,
+        "the tag wears dev's"
+    );
+    // The line between dev's last commit and the branch point is still dev's.
+    assert_eq!(rows[1].edges[0].color, rows[0].color);
+}
+
+#[test]
+fn the_main_branch_is_colour_zero_and_others_never_are() {
+    let r = linear(2);
+    r.git(&["branch", "-M", "main"]);
+    // Several branches, each with its own commit, and a merge back into main.
+    for name in ["a", "b", "c"] {
+        r.git(&["switch", "-q", "-c", name, "main"]);
+        r.commit_file(&format!("{name}.txt"), "x\n", &format!("on {name}"));
+    }
+    r.git(&["switch", "-q", "main"]);
+    r.commit_file("m.txt", "m\n", "on main");
+    r.merge(&["a"], "merge a");
+    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let main_ids: Vec<String> = r
+        .git(&["rev-list", "--first-parent", "main"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    for row in g.rows(0, g.len() as u32).unwrap() {
+        if main_ids.contains(&row.id) {
+            assert_eq!(row.color, 0, "{}", row.subject);
+        } else {
+            assert_ne!(row.color, 0, "{}", row.subject);
+        }
     }
 }

@@ -4,13 +4,52 @@
 import type { ProjectView } from "./bindings/ProjectView";
 import type { Session } from "./bindings/Session";
 
-export const VIEWS: { id: ProjectView; label: string }[] = [
-    { id: "overview", label: "Overview" },
-    { id: "graph", label: "Graph" },
-    { id: "log", label: "Log" },
-    { id: "staging", label: "Staging" },
-    { id: "releases", label: "Releases" },
-    { id: "settings", label: "Settings" },
+export const VIEWS: { id: ProjectView; label: string; hint: string }[] = [
+    {
+        id: "overview",
+        label: "Overview",
+        hint: "The folder, current branch and state of this project",
+    },
+    {
+        id: "graph",
+        label: "Graph",
+        hint: "Every commit drawn as a branching graph, with its branches and tags",
+    },
+    {
+        id: "log",
+        label: "Log",
+        hint: "Every commit as a plain list, newest first",
+    },
+    {
+        id: "changes",
+        label: "Changes",
+        hint: "See the files you have changed and save them as a commit",
+    },
+    {
+        id: "files",
+        label: "Files",
+        hint: "Browse the project's files and edit them",
+    },
+    {
+        id: "staging",
+        label: "Staging",
+        hint: "Move work from the private branch to the public one (coming later)",
+    },
+    {
+        id: "releases",
+        label: "Releases",
+        hint: "Make a numbered release of this project (coming later)",
+    },
+    {
+        id: "activity",
+        label: "Activity",
+        hint: "Everything this app has run in your project, and the backups it took",
+    },
+    {
+        id: "settings",
+        label: "Settings",
+        hint: "Settings for this project (coming later)",
+    },
 ];
 
 /** Show a project's tab, opening it at the end if needed. */

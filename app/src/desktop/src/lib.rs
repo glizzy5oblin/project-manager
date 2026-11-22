@@ -1,5 +1,7 @@
+pub mod actions;
 pub mod backup;
 mod commands;
+pub mod files;
 pub mod git;
 pub mod github;
 pub mod history;
@@ -19,6 +21,10 @@ pub fn run() {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         .level(log::LevelFilter::Info)
+                        // The file watcher logs "unable to remove watch descriptor" (harmless: the
+                        // kernel already dropped it when a watched folder was deleted) once per
+                        // deleted folder, which floods the log during builds.
+                        .level_for("notify", log::LevelFilter::Warn)
                         .build(),
                 )?;
             }
@@ -58,6 +64,22 @@ pub fn run() {
             commands::commit_detail,
             commands::file_diff,
             commands::file_blame,
+            commands::work_diff,
+            commands::work_stats,
+            commands::action_preview,
+            commands::stash_list,
+            commands::action_run,
+            commands::conflict_info,
+            commands::open_folder,
+            commands::files_list,
+            commands::file_read,
+            commands::file_write,
+            commands::file_create,
+            commands::backups_list,
+            commands::backup_preview,
+            commands::backup_restore,
+            commands::op_log,
+            commands::op_log_clear,
         ])
         .run(tauri::generate_context!())
         .expect("error while building tauri application");

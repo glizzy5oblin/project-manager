@@ -1,6 +1,7 @@
 //! Git access. Reads use gix (in-process, fast); writes go through the git CLI so they behave
 //! exactly like the user's own git, including hooks, credential helpers and SSH config.
 
+pub mod conflict;
 mod runner;
 pub mod state;
 mod trust;

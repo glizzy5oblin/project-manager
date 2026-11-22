@@ -21,6 +21,11 @@ trusted: boolean, head: HeadState, branches: Array<BranchInfo>, remoteBranches: 
  */
 status: StatusSummary | null, inProgress: Operation | null, 
 /**
+ * The commit message git prepared for the merge in progress (`MERGE_MSG`), without its
+ * `#` comment lines, for the commit editor to start from. `None` outside a merge.
+ */
+mergeMessage: string | null, 
+/**
  * `.gitmodules` exists. Submodules are detected and warned about only (agreed policy).
  */
 hasSubmodules: boolean, };

@@ -1,6 +1,6 @@
 [package]
 name = "project-manager"
-version = "0.0.1"
+version = "0.0.2"
 description = "Project Manager: git and GitHub manager for private and public project repos"
 authors = []
 license = ""

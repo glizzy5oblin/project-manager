@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/glizzy5oblin/project-manager"><img alt="Version" src="https://img.shields.io/badge/version-0.0.1-2f6fe4?style=for-the-badge"></a>
+  <a href="https://github.com/glizzy5oblin/project-manager"><img alt="Version" src="https://img.shields.io/badge/version-0.0.2-2f6fe4?style=for-the-badge"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4?style=for-the-badge">
   <a href="https://tauri.app"><img alt="Tauri 2" src="https://img.shields.io/badge/Tauri-2-24c8db?style=for-the-badge&logo=tauri&logoColor=white"></a>
   <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-stable-b7410e?style=for-the-badge&logo=rust&logoColor=white"></a>

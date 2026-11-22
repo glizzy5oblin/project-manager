@@ -62,16 +62,25 @@
         <h1>Projects</h1>
         <div class="tools">
             <button
+                title="Add a project folder that is already on your computer"
                 type="button"
                 class="primary"
                 onclick={() => (dialog = "add")}
             >
                 Add existing
             </button>
-            <button type="button" onclick={() => (dialog = "clone")}>
+            <button
+                title="Copy a repository from the internet, such as GitHub, to your computer"
+                type="button"
+                onclick={() => (dialog = "clone")}
+            >
                 Clone
             </button>
-            <button type="button" onclick={() => (dialog = "create")}>
+            <button
+                title="Start a brand-new project in a new folder"
+                type="button"
+                onclick={() => (dialog = "create")}
+            >
                 Create new
             </button>
             <button
@@ -93,6 +102,7 @@
             <label class="theme">
                 <span>Theme</span>
                 <select
+                    title="Change the colours of the app"
                     value={themeId}
                     onchange={(e) => ontheme(e.currentTarget.value)}
                 >
@@ -110,7 +120,7 @@
 
     {#if themeProblems.length}
         <details class="theme-problems">
-            <summary>
+            <summary title="Theme files that could not be loaded">
                 {themeProblems.length === 1
                     ? "1 theme file could not be loaded"
                     : `${themeProblems.length} theme files could not be loaded`}
@@ -133,7 +143,9 @@
                 />
             {/each}
         </div>
-    {:else if !loading}
+    {:else if loading}
+        <p class="muted" role="status">Loading projects…</p>
+    {:else}
         <div class="empty">
             <p>No projects yet.</p>
             <p class="muted">
@@ -169,10 +181,15 @@
             not touched, and it can be added again later.
         </p>
         {#snippet actions()}
-            <button type="button" onclick={() => (removing = null)}>
+            <button
+                title="Keep this project in the hub"
+                type="button"
+                onclick={() => (removing = null)}
+            >
                 Cancel
             </button>
             <button
+                title="Remove this project from the hub. Its folder and files are not deleted"
                 type="button"
                 class="danger"
                 onclick={() => {

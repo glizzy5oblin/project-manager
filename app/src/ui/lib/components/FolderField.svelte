@@ -23,7 +23,13 @@
                  path's own characters (a leading "/") in left-to-right order. -->
             {value ? `\u200e${value}\u200e` : "No folder chosen"}
         </span>
-        <button type="button" onclick={pick}>Choose…</button>
+        <button
+            title="Pick a folder on your computer"
+            type="button"
+            onclick={pick}
+        >
+            Choose…
+        </button>
     </div>
 </div>
 

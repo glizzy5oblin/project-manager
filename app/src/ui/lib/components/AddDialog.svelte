@@ -39,7 +39,9 @@
 
 <Modal title="Add existing project" {onclose}>
     <p class="hint">
-        Pick the top folder of a git repository that holds a <code>.proj</code> file.
+        Pick the top folder of a git repository that holds a <code>.proj</code>
+        file, or a project folder with <code>private</code> and
+        <code>public</code> repositories in it (the private one is added).
     </p>
     <FolderField
         label="Repository folder"
@@ -51,13 +53,20 @@
     {/if}
     {#if needsProj}
         <p>
-            Create a starter <code>.proj</code> file in this folder and add it?
+            Create a starter <code>.proj</code> file in that repository and add it?
         </p>
         <ModeField bind:value={mode} />
     {/if}
     {#snippet actions()}
-        <button type="button" onclick={onclose}>Cancel</button>
         <button
+            title="Close without adding anything"
+            type="button"
+            onclick={onclose}
+        >
+            Cancel
+        </button>
+        <button
+            title="Add this folder to your list of projects"
             type="button"
             class="primary"
             disabled={!path || busy}

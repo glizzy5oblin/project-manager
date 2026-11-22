@@ -81,6 +81,7 @@
             <span>Repository URL</span>
             <!-- svelte-ignore a11y_autofocus -->
             <input
+                title="The web address of the repository to copy, for example from the Code button on GitHub"
                 bind:value={url}
                 autofocus
                 spellcheck="false"
@@ -96,6 +97,7 @@
         <label class="field">
             <span>Folder name</span>
             <input
+                title="The name of the new folder the project is copied into"
                 bind:value={name}
                 spellcheck="false"
                 placeholder={suggested || "folder name"}
@@ -115,23 +117,44 @@
     {/if}
     {#snippet actions()}
         {#if cloned}
-            <button type="button" onclick={onclose}>Close</button>
+            <button title="Close this window" type="button" onclick={onclose}>
+                Close
+            </button>
             {#if cloned.notAdded?.kind === "noProjFile"}
-                <button type="button" class="primary" onclick={addWithProj}>
+                <button
+                    title="Create the .proj file this project needs and add it to your projects"
+                    type="button"
+                    class="primary"
+                    onclick={addWithProj}
+                >
                     Create .proj and add
                 </button>
             {/if}
         {:else if taskId !== null}
-            <button type="button" onclick={onclose}>Hide</button>
             <button
+                title="Hide this window. The clone keeps going in the background"
+                type="button"
+                onclick={onclose}
+            >
+                Hide
+            </button>
+            <button
+                title="Stop copying the repository"
                 type="button"
                 onclick={() => taskId !== null && api.taskCancel(taskId)}
             >
                 Cancel clone
             </button>
         {:else}
-            <button type="button" onclick={onclose}>Cancel</button>
             <button
+                title="Close without cloning anything"
+                type="button"
+                onclick={onclose}
+            >
+                Cancel
+            </button>
+            <button
+                title="Copy the repository to your computer and add it to your projects"
                 type="button"
                 class="primary"
                 disabled={!url.trim() ||

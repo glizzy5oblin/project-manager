@@ -1,11 +1,14 @@
 <script lang="ts">
-    // One file's changes in a commit, unified or side by side, with syntax colors and changed
-    // words marked. Binary, oversized, mode-only and renamed files get a short explanation.
+    // One file's changes in a commit (or, with `work`, its uncommitted change), unified or side
+    // by side, with syntax colors and changed words marked. Binary, oversized, mode-only and renamed files get a short explanation.
+    import { untrack } from "svelte";
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { ChangedFile } from "../bindings/ChangedFile";
     import type { DiffLine } from "../bindings/DiffLine";
     import type { FileDiff } from "../bindings/FileDiff";
+    import type { Hunk } from "../bindings/Hunk";
+    import type { WorkSide } from "../bindings/WorkSide";
     import { highlight } from "../highlight";
     import { langForPath, splitRows, type Token } from "../history";
     import CodeText from "./CodeText.svelte";
@@ -13,21 +16,40 @@
 
     let {
         projectId,
-        commit,
-        parent,
+        commit = "",
+        parent = null,
+        work = null,
+        version = 0,
         file,
         mode = $bindable("unified"),
+        hunkAction = null,
     }: {
         projectId: string;
-        commit: string;
-        parent: number | null;
+        commit?: string;
+        parent?: number | null;
+        /** Show the file's staged or unstaged change instead of a commit's. */
+        work?: WorkSide | null;
+        /** Bump to load again (the working tree changed). */
+        version?: number;
         file: ChangedFile;
         mode?: "unified" | "split";
+        /**
+         * A button on each hunk header of a modified text file (staging one hunk). The diff
+         * reloads once `run` settles.
+         */
+        hunkAction?: {
+            label: string;
+            title: string;
+            disabled: boolean;
+            run: (hunk: Hunk) => Promise<unknown>;
+        } | null;
     } = $props();
 
     /** Lines shown before "Show more"; a huge forced diff would otherwise freeze the view. */
     const STEP = 3000;
     const HARD_LIMIT = 16 * 1024 * 1024;
+    /** Over this the backend wants `force` (history/diff.rs LARGE_FILE). */
+    const LARGE = 1024 * 1024;
 
     // Raw, not deep state: colorize keys tokens by the line objects the template iterates.
     let diff = $state.raw<FileDiff | null>(null);
@@ -42,14 +64,16 @@
         loading = true;
         error = null;
         try {
-            const d = await api.fileDiff(
-                projectId,
-                commit,
-                parent,
-                file.path,
-                file.oldPath,
-                force,
-            );
+            const d = work
+                ? await api.workDiff(projectId, file.path, work, force)
+                : await api.fileDiff(
+                      projectId,
+                      commit,
+                      parent,
+                      file.path,
+                      file.oldPath,
+                      force,
+                  );
             if (mine !== request) return;
             diff = d;
             limit = STEP;
@@ -90,27 +114,57 @@
     }
 
     $effect(() => {
-        void [projectId, commit, parent, file.path, file.oldPath];
+        void [projectId, commit, parent, work, file.path, file.oldPath];
         diff = null;
         void load(false);
+    });
+    // A working-tree change reloads in place, keeping what is on screen until the new diff
+    // arrives (and keeping a forced large diff forced).
+    let seen = untrack(() => version);
+    $effect(() => {
+        if (version === seen) return;
+        seen = version;
+        if (work) void load(diff ? !diff.tooLarge && big > LARGE : false);
     });
 
     const total = $derived(
         diff?.hunks.reduce((n, h) => n + h.lines.length, 0) ?? 0,
     );
 
-    /** Hunks cut down to the first `limit` lines. */
+    /** Hunks cut down to the first `limit` lines; `whole` when none of a hunk is hidden. */
     const shown = $derived.by(() => {
         if (!diff) return [];
         let left = limit;
         const out = [];
         for (const h of diff.hunks) {
             if (left <= 0) break;
-            out.push({ ...h, lines: h.lines.slice(0, left) });
+            out.push({
+                hunk: h,
+                lines: h.lines.slice(0, left),
+                whole: h.lines.length <= left,
+            });
             left -= h.lines.length;
         }
         return out;
     });
+
+    const LINK = "120000";
+    /** Only a modified text file can be staged in parts (actions/hunks.rs refuses the rest). */
+    const partial = $derived(
+        !!hunkAction &&
+            diff?.status === "modified" &&
+            diff.oldMode !== LINK &&
+            diff.newMode !== LINK,
+    );
+
+    async function runHunk(h: Hunk) {
+        if (!hunkAction) return;
+        try {
+            await hunkAction.run(h);
+        } finally {
+            await load(!!diff && !diff.tooLarge && big > LARGE);
+        }
+    }
 
     const sizeText = (n: number | null) =>
         n === null
@@ -136,6 +190,7 @@
         <span class="spacer"></span>
         <div class="modes" role="group" aria-label="Diff layout">
             <button
+                title="Show old and new lines in one column"
                 type="button"
                 class:on={mode === "unified"}
                 aria-pressed={mode === "unified"}
@@ -144,6 +199,7 @@
                 Unified
             </button>
             <button
+                title="Show old lines on the left and new lines on the right"
                 type="button"
                 class:on={mode === "split"}
                 aria-pressed={mode === "split"}
@@ -176,6 +232,7 @@
                 This file is large ({sizeText(big)}).
                 {#if big <= HARD_LIMIT}
                     <button
+                        title="Load this large diff even though it may be slow"
                         type="button"
                         onclick={() => load(true)}
                         disabled={loading}
@@ -190,12 +247,26 @@
             <p class="note">No text changes.</p>
         {:else}
             <div class="code" class:split={mode === "split"}>
-                {#each shown as h, hi (hi)}
+                {#each shown as { hunk: h, lines, whole }, hi (hi)}
                     <div class="hunk">
-                        @@ −{h.oldStart},{h.oldLines} +{h.newStart},{h.newLines} @@
+                        <span>
+                            @@ −{h.oldStart},{h.oldLines} +{h.newStart},{h.newLines}
+                            @@
+                        </span>
+                        {#if partial && hunkAction && whole}
+                            <button
+                                type="button"
+                                class="hunk-act"
+                                disabled={hunkAction.disabled}
+                                title={hunkAction.title}
+                                onclick={() => runHunk(h)}
+                            >
+                                {hunkAction.label}
+                            </button>
+                        {/if}
                     </div>
                     {#if mode === "unified"}
-                        {#each h.lines as l, li (li)}
+                        {#each lines as l, li (li)}
                             <div class="line {l.kind}">
                                 <span class="no">{l.oldLine ?? ""}</span>
                                 <span class="no">{l.newLine ?? ""}</span>
@@ -215,7 +286,7 @@
                             </div>
                         {/each}
                     {:else}
-                        {#each splitRows(h.lines) as r, ri (ri)}
+                        {#each splitRows(lines) as r, ri (ri)}
                             <div class="pair">
                                 {#each [r.left, r.right] as l, side (side)}
                                     {#if l}
@@ -245,7 +316,11 @@
             {#if total > limit}
                 <p class="note">
                     Showing {limit} of {total} lines.
-                    <button type="button" onclick={() => (limit += STEP)}>
+                    <button
+                        title="Load more of this diff"
+                        type="button"
+                        onclick={() => (limit += STEP)}
+                    >
                         Show more
                     </button>
                 </p>
@@ -321,9 +396,22 @@
     .hunk {
         position: sticky;
         left: 0;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
         padding: 0.15rem 0.6rem;
         background: var(--surface-2);
         color: var(--text-muted);
+    }
+    .hunk-act {
+        padding: 0 0.5rem;
+        /* The UI's font, not the code's. */
+        font-family:
+            system-ui,
+            -apple-system,
+            "Segoe UI",
+            sans-serif;
+        font-size: 0.8rem;
     }
     .line {
         display: grid;

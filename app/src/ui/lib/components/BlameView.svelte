@@ -115,7 +115,11 @@
         {#if blame.lines.length > limit}
             <p class="note">
                 Showing {limit} of {blame.lines.length} lines.
-                <button type="button" onclick={() => (limit += STEP)}>
+                <button
+                    title="Load the next lines of this file"
+                    type="button"
+                    onclick={() => (limit += STEP)}
+                >
                     Show more
                 </button>
             </p>

@@ -410,3 +410,63 @@ fn clone_refuses_bad_urls_and_cleans_up() {
 fn canonical(p: &std::path::Path) -> PathBuf {
     super::dunce_simplified(std::fs::canonicalize(p).unwrap())
 }
+
+#[test]
+fn add_takes_the_private_repository_of_a_project_folder() {
+    // The layout Create makes, but without a .proj file yet (as in a project made by hand).
+    let parent = tempfile::tempdir().unwrap();
+    let root = create_project(parent.path(), "Tardis", WorkflowMode::TwoRepo).unwrap();
+    std::fs::remove_file(root.join("Tardis.proj")).unwrap();
+    let folder = parent.path().join("Tardis");
+    let (_d, mut reg) = registry();
+
+    // Without a .proj the private repository is found, so the dialog can offer a starter file.
+    let e = reg.add(&folder, None, 0).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::NoProjFile, "{e:?}");
+    let e = reg.add(&folder, Some(WorkflowMode::TwoRepo), 0).unwrap();
+    assert_eq!(e.path, canonical(&folder.join("private")));
+    assert_eq!(
+        e.name, "Tardis",
+        "named after the project folder, not private/"
+    );
+    let proj = ProjFile::load(&folder.join("private/Tardis.proj")).unwrap();
+    assert_eq!(proj.workflow.public.path.as_deref(), Some("../public"));
+    // Either folder names the same project.
+    assert_eq!(reg.add(&folder, None, 1).unwrap(), e);
+    assert_eq!(reg.add(&folder.join("private"), None, 1).unwrap(), e);
+    assert_eq!(reg.list().len(), 1);
+
+    // No public folder beside it: the usual sibling name.
+    let solo = tempfile::tempdir().unwrap();
+    let root = create_project(solo.path(), "Solo", WorkflowMode::SingleRepo).unwrap();
+    std::fs::remove_file(root.join("Solo.proj")).unwrap();
+    let e = reg
+        .add(&solo.path().join("Solo"), Some(WorkflowMode::TwoRepo), 0)
+        .unwrap();
+    assert_eq!(e.name, "Solo");
+    let proj = ProjFile::load(&root.join("Solo.proj")).unwrap();
+    assert_eq!(proj.workflow.public.path.as_deref(), Some("../Solo-public"));
+
+    // A private/ that is not a repository leaves the folder as it was: not a repository.
+    let plain = tempfile::tempdir().unwrap();
+    std::fs::create_dir(plain.path().join("private")).unwrap();
+    assert_eq!(
+        reg.add(plain.path(), None, 0).unwrap_err().kind,
+        ErrorKind::NotARepo
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_does_not_follow_a_private_symlink() {
+    let r = linear(1);
+    with_proj(&r);
+    let folder = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(r.path(), folder.path().join("private")).unwrap();
+    let (_d, mut reg) = registry();
+    assert_eq!(
+        reg.add(folder.path(), None, 0).unwrap_err().kind,
+        ErrorKind::NotARepo
+    );
+    assert!(reg.list().is_empty());
+}

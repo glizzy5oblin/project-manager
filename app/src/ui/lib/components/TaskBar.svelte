@@ -11,6 +11,7 @@
                 <span class="phase">{t.phase || t.message}</span>
                 <progress max="100" value={t.percent ?? undefined}></progress>
                 <button
+                    title="Stop this task"
                     type="button"
                     onclick={() => api.taskCancel(t.id)}
                     aria-label={`Cancel ${t.title}`}

@@ -4,7 +4,9 @@
 //!
 //! - `head`: the commit HEAD pointed at (absent on an unborn branch);
 //! - `heads/<branch>` and `tags/<tag>`: every local branch and tag;
-//! - `index`: a commit whose tree is the staged index (absent when the index had conflicts);
+//! - `index`: a commit whose tree is the staged index; with conflicts, the entries that are not
+//!   conflicted (the conflicted ones are listed in the record, their blobs kept by `blobs/<n>`);
+//! - `pending/<n>`: the commits a merge, cherry-pick or revert in progress was applying;
 //! - `worktree`: a commit whose tree is the whole working tree, untracked files included
 //!   (ignored files are not), built in a temporary index so the real index and `refs/stash`
 //!   are never touched.
@@ -17,6 +19,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,6 +70,16 @@ pub struct RefTip {
     pub commit: String,
 }
 
+/// One entry of the stash list when a backup was taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct StashTip {
+    pub commit: String,
+    /// The reflog subject git shows in `git stash list`, e.g. `On main: before the merge`.
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -82,15 +95,33 @@ pub struct BackupRecord {
     pub head_commit: Option<String>,
     pub branches: Vec<RefTip>,
     pub tags: Vec<RefTip>,
-    /// Commit holding the index tree; `None` when the index had conflicts.
+    /// Commit holding the index tree (without conflicted entries). `None` only in backups made
+    /// before conflicts were recorded, when the index had conflicts.
     pub index_commit: Option<String>,
     /// Commit holding the working tree including untracked files.
     pub worktree_commit: Option<String>,
     /// Files that were untracked at backup time (restored as untracked).
     pub untracked: Vec<String>,
-    /// The index had unresolved conflicts; restoring brings back the files but not the
-    /// conflict stages.
+    /// The index had unresolved conflicts.
     pub conflicted: bool,
+    /// Conflicted index entries as `git ls-files -u` prints them (`<mode> <object> <stage>`, a
+    /// tab, the path). Restored exactly.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    /// What an operation in progress was applying: `MERGE_HEAD` (once per merged commit),
+    /// `CHERRY_PICK_HEAD` or `REVERT_HEAD`, with the commit.
+    #[serde(default)]
+    pub pending: Vec<RefTip>,
+    /// The prepared commit message of that operation (`MERGE_MSG`).
+    #[serde(default)]
+    pub merge_msg: Option<String>,
+    /// `MERGE_MODE` (e.g. `no-ff`).
+    #[serde(default)]
+    pub merge_mode: Option<String>,
+    /// The stash list, newest first. Each stash commit is kept under `stash/<n>`, so dropping a
+    /// stash does not lose it, and a restore puts back the ones that are gone.
+    #[serde(default)]
+    pub stashes: Vec<StashTip>,
     /// The repository uses Git LFS.
     pub lfs: bool,
     #[ts(type = "string | null")]
@@ -118,6 +149,38 @@ pub struct RestoreOutcome {
     pub warnings: Vec<String>,
 }
 
+/// One branch or tag that restoring a backup would move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct RefMove {
+    pub name: String,
+    /// `branch` or `tag`.
+    pub kind: String,
+    /// Where it points now; `None` when it no longer exists (restoring brings it back).
+    pub from: Option<String>,
+    pub to: String,
+}
+
+/// What restoring a backup would change, in terms a person can read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePreview {
+    pub backup: BackupRecord,
+    /// Branches and tags that would move or come back.
+    pub moves: Vec<RefMove>,
+    /// The branch HEAD is on now (`None` when detached), and the one it would return to.
+    pub head_now: Option<String>,
+    pub head_then: Option<String>,
+    /// Files with uncommitted changes now; restoring replaces them (a backup is taken first).
+    pub changed_now: u32,
+    /// Files that were untracked when the backup was taken and would be put back.
+    pub untracked_then: u32,
+    /// Stashes in the backup that are no longer in the list.
+    pub stashes_missing: u32,
+}
+
 /// How many backups to keep. Both limits apply; `None` means no limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -140,20 +203,44 @@ impl Default for Retention {
 pub struct Backups {
     root: PathBuf,
     git_dir: PathBuf,
+    /// An empty regular file used as `core.hooksPath` (see [`Backups::git`]).
+    no_hooks: PathBuf,
 }
 
 impl Backups {
     pub fn open(root: &Path) -> Result<Self, BackupError> {
         let git_dir = PathBuf::from(
-            git(root)
+            GitCommand::new(root)
                 .args(["rev-parse", "--absolute-git-dir"])
                 .run()?
                 .stdout_str(),
         );
+        let no_hooks = no_hooks_file(&git_dir)?;
         Ok(Backups {
             root: root.to_path_buf(),
             git_dir,
+            no_hooks,
         })
+    }
+
+    /// A git command in the working tree that never runs hooks: backups must not trigger user
+    /// hooks. `core.hooksPath` points at an empty regular file, so git finds no hooks there,
+    /// and tools that install hooks into that path (git-lfs does, from its filters) cannot
+    /// write anything. `/dev/null` did the same on Unix, but Git for Windows passes it on
+    /// unchanged and git-lfs there read it as a relative path and wrote `dev/null/` hook files
+    /// into the working tree.
+    fn git(&self) -> GitCommand {
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(&self.no_hooks);
+        GitCommand::new(&self.root).arg("-c").arg(hooks)
+    }
+
+    /// For the commands that copy working-tree bytes into a snapshot and back. `core.autocrlf`
+    /// (on by default in Git for Windows) would store CRLF files as LF and write LF files back
+    /// as CRLF, so a restore would not give back the same bytes. Line-ending rules a repository
+    /// sets in `.gitattributes` still apply, as they would to any checkout.
+    fn git_exact(&self) -> GitCommand {
+        self.git().args(["-c", "core.autocrlf=false"])
     }
 
     fn index_path(&self) -> PathBuf {
@@ -217,28 +304,34 @@ impl Backups {
 
         let head_commit = self.rev_opt("HEAD")?;
         let head_branch = {
-            let o = git(&self.root)
+            let o = self
+                .git()
                 .args(["symbolic-ref", "-q", "--short", "HEAD"])
                 .output()?;
             o.success().then(|| o.stdout_str())
         };
         let branches = self.tips("refs/heads/")?;
         let tags = self.tips("refs/tags/")?;
+        let pending = self.pending_heads()?;
+        let merge_msg = self.read_git_file("MERGE_MSG")?;
+        let merge_mode = self.read_git_file("MERGE_MODE")?;
+        let stashes = self.stashes()?;
 
-        // Index tree: fails when there are unmerged entries.
-        let index_tree = {
-            let o = git(&self.root).arg("write-tree").output()?;
-            o.success().then(|| o.stdout_str())
-        };
-        let conflicted = index_tree.is_none();
-        let index_commit = match &index_tree {
-            Some(tree) => Some(self.commit_tree(
-                tree,
-                head_commit.as_deref(),
-                &format!("pm backup {id}: index"),
-            )?),
-            None => None,
-        };
+        // The index: conflicted entries listed, the rest as a tree.
+        let conflicts = split_z(&self.git().args(["ls-files", "-u", "-z"]).run()?.stdout);
+        let conflicted = !conflicts.is_empty();
+        let index_tree = self.index_tree(&conflicts)?;
+        let index_commit = Some(self.commit_tree(
+            &index_tree,
+            head_commit.as_deref(),
+            &format!("pm backup {id}: index"),
+        )?);
+        let mut conflict_blobs: Vec<&str> = conflicts
+            .iter()
+            .filter_map(|l| l.split(' ').nth(1))
+            .collect();
+        conflict_blobs.sort_unstable();
+        conflict_blobs.dedup();
 
         // Working tree including untracked files, via a temporary copy of the index.
         let (worktree_tree, untracked) = self.snapshot_worktree()?;
@@ -265,8 +358,17 @@ impl Backups {
         if let Some(c) = &index_commit {
             add(format!("{prefix}index"), c);
         }
+        for (n, p) in pending.iter().enumerate() {
+            add(format!("{prefix}pending/{n}"), &p.commit);
+        }
+        for (n, blob) in conflict_blobs.iter().enumerate() {
+            add(format!("{prefix}blobs/{n}"), blob);
+        }
+        for (n, st) in stashes.iter().enumerate() {
+            add(format!("{prefix}stash/{n}"), &st.commit);
+        }
         add(format!("{prefix}worktree"), &worktree_commit);
-        git(&self.root)
+        self.git()
             .args(["update-ref", "--stdin"])
             .stdin(updates)
             .run()?;
@@ -284,6 +386,11 @@ impl Backups {
             worktree_commit: Some(worktree_commit),
             untracked,
             conflicted,
+            conflicts,
+            pending,
+            merge_msg,
+            merge_mode,
+            stashes,
             lfs,
             bundle: None,
         };
@@ -307,8 +414,120 @@ impl Backups {
         Ok(record)
     }
 
+    /// The stash list, newest first.
+    fn stashes(&self) -> Result<Vec<StashTip>, BackupError> {
+        let out = self
+            .git()
+            .args(["stash", "list", "-z", "--format=%H%x1f%gs"])
+            .run()?;
+        Ok(out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let text = String::from_utf8_lossy(e);
+                let (commit, message) = text.split_once('\u{1f}')?;
+                Some(StashTip {
+                    commit: commit.to_string(),
+                    message: message.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// The heads of a merge, cherry-pick or revert in progress.
+    fn pending_heads(&self) -> Result<Vec<RefTip>, BackupError> {
+        let mut out = Vec::new();
+        // MERGE_HEAD is a file with one commit per line (several for an octopus merge).
+        if let Some(text) = self.read_git_file("MERGE_HEAD")? {
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let commit = self.rev_opt(line)?.ok_or_else(|| GitError::Read {
+                    path: self.git_dir.join("MERGE_HEAD"),
+                    message: format!("MERGE_HEAD names {line:?}, which is not a commit"),
+                })?;
+                out.push(RefTip {
+                    name: "MERGE_HEAD".into(),
+                    commit,
+                });
+            }
+        }
+        for name in ["CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+            if let Some(commit) = self.rev_opt(name)? {
+                out.push(RefTip {
+                    name: name.into(),
+                    commit,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// A file in the git dir, `None` when it does not exist.
+    fn read_git_file(&self, name: &str) -> Result<Option<String>, BackupError> {
+        let path = self.git_dir.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BackupError::io(&path, e)),
+        }
+    }
+
+    fn write_git_file(&self, name: &str, text: &str) -> Result<(), BackupError> {
+        let path = self.git_dir.join(name);
+        std::fs::write(&path, text).map_err(|e| BackupError::io(&path, e))
+    }
+
+    /// Tree of the index. With `conflicts` (from `ls-files -u`), the tree of everything else,
+    /// built in a copy of the index so the real one keeps its conflicts.
+    fn index_tree(&self, conflicts: &[String]) -> Result<String, BackupError> {
+        if conflicts.is_empty() {
+            return Ok(self.git().arg("write-tree").run()?.stdout_str());
+        }
+        let mut paths: Vec<&str> = conflicts
+            .iter()
+            .filter_map(|l| l.split_once('\t').map(|(_, p)| p))
+            .collect();
+        paths.dedup();
+        let mut stdin = Vec::new();
+        for p in paths {
+            stdin.extend_from_slice(p.as_bytes());
+            stdin.push(0);
+        }
+        let tmp_index = self
+            .git_dir
+            .join("pm")
+            .join(format!("merged-index-{}", std::process::id()));
+        let real_index = self.real_index()?;
+        let result = (|| {
+            std::fs::copy(&real_index, &tmp_index).map_err(|e| BackupError::io(&tmp_index, e))?;
+            self.git()
+                .env("GIT_INDEX_FILE", &tmp_index)
+                .args(["update-index", "--force-remove", "-z", "--stdin"])
+                .stdin(stdin)
+                .run()?;
+            Ok(self
+                .git()
+                .env("GIT_INDEX_FILE", &tmp_index)
+                .arg("write-tree")
+                .run()?
+                .stdout_str())
+        })();
+        let _ = std::fs::remove_file(&tmp_index);
+        result
+    }
+
+    fn real_index(&self) -> Result<PathBuf, BackupError> {
+        Ok(PathBuf::from(
+            self.git()
+                .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+                .run()?
+                .stdout_str(),
+        ))
+    }
+
     fn rev_opt(&self, rev: &str) -> Result<Option<String>, BackupError> {
-        let o = git(&self.root)
+        let o = self
+            .git()
             .args(["rev-parse", "-q", "--verify", &format!("{rev}^{{commit}}")])
             .output()?;
         Ok(o.success().then(|| o.stdout_str()))
@@ -316,7 +535,8 @@ impl Backups {
 
     /// (short name, object id) of every ref under `prefix`.
     fn tips(&self, prefix: &str) -> Result<Vec<RefTip>, BackupError> {
-        let out = git(&self.root)
+        let out = self
+            .git()
             .args(["for-each-ref", "--format=%(objectname) %(refname)", prefix])
             .run()?
             .stdout_str();
@@ -340,7 +560,7 @@ impl Backups {
         parent: Option<&str>,
         message: &str,
     ) -> Result<String, BackupError> {
-        let mut c = backup_identity(git(&self.root)).args([
+        let mut c = backup_identity(self.git()).args([
             "-c",
             "commit.gpgsign=false",
             "commit-tree",
@@ -359,26 +579,23 @@ impl Backups {
         let tmp_dir = self.git_dir.join("pm");
         std::fs::create_dir_all(&tmp_dir).map_err(|e| BackupError::io(&tmp_dir, e))?;
         let tmp_index = tmp_dir.join(format!("snapshot-index-{}", std::process::id()));
-        let real_index = PathBuf::from(
-            git(&self.root)
-                .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
-                .run()?
-                .stdout_str(),
-        );
+        let real_index = self.real_index()?;
         let result = (|| {
             if real_index.exists() {
                 std::fs::copy(&real_index, &tmp_index)
                     .map_err(|e| BackupError::io(&tmp_index, e))?;
             }
-            let untracked = git(&self.root)
+            let untracked = self
+                .git()
                 .args(["ls-files", "-z", "--others", "--exclude-standard"])
                 .run()?;
             let untracked = split_z(&untracked.stdout);
-            git_exact(&self.root)
+            self.git_exact()
                 .env("GIT_INDEX_FILE", &tmp_index)
                 .args(["add", "-A", "--", "."])
                 .run()?;
-            let tree = git(&self.root)
+            let tree = self
+                .git()
                 .env("GIT_INDEX_FILE", &tmp_index)
                 .arg("write-tree")
                 .run()?
@@ -403,12 +620,12 @@ impl Backups {
             .into_iter()
             .map(|t| format!("{REF_PREFIX}{id}/{}", t.name))
             .collect();
-        git(&self.root)
+        self.git()
             .args(["bundle", "create", "-q"])
             .arg(&path)
             .args(&refs)
             .run()?;
-        git(&self.root)
+        self.git()
             .args(["bundle", "verify", "-q"])
             .arg(&path)
             .run()?;
@@ -422,7 +639,7 @@ impl Backups {
             .bundle
             .ok_or_else(|| BackupError::NoBundle(id.to_string()))?;
         let spec = format!("+{REF_PREFIX}{id}/*:{REF_PREFIX}{id}/*");
-        git(&self.root)
+        self.git()
             .args(["fetch", "-q", "--no-tags", "--no-write-fetch-head"])
             .arg(&bundle)
             .arg(spec)
@@ -437,7 +654,7 @@ impl Backups {
             stdin.push_str(&format!("delete {prefix}{}\n", t.name));
         }
         if !stdin.is_empty() {
-            git(&self.root)
+            self.git()
                 .args(["update-ref", "--stdin"])
                 .stdin(stdin)
                 .run()?;
@@ -478,6 +695,77 @@ impl Backups {
         Ok(doomed)
     }
 
+    /// What [`Backups::restore`] of `id` would change, without changing anything.
+    pub fn preview(&self, id: &str) -> Result<RestorePreview, BackupError> {
+        let rec = self.get(id)?;
+        let refs = self
+            .git()
+            .args([
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags",
+            ])
+            .run()?
+            .stdout_str();
+        let now: std::collections::HashMap<&str, &str> =
+            refs.lines().filter_map(|l| l.split_once(' ')).collect();
+        let mut moves = Vec::new();
+        for (kind, prefix, tips) in [
+            ("branch", "refs/heads/", &rec.branches),
+            ("tag", "refs/tags/", &rec.tags),
+        ] {
+            for t in tips {
+                let from = now.get(format!("{prefix}{}", t.name).as_str()).copied();
+                if from != Some(t.commit.as_str()) {
+                    moves.push(RefMove {
+                        name: t.name.clone(),
+                        kind: kind.to_string(),
+                        from: from.map(str::to_string),
+                        to: t.commit.clone(),
+                    });
+                }
+            }
+        }
+        let head_now = {
+            let out = self
+                .git()
+                .args(["symbolic-ref", "-q", "--short", "HEAD"])
+                .output()?;
+            out.success().then(|| out.stdout_str())
+        };
+        let changed_now = self
+            .git()
+            .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+            .run()?
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .count() as u32;
+        let listed: Vec<String> = self
+            .git()
+            .args(["stash", "list", "--format=%H"])
+            .run()?
+            .stdout_str()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let stashes_missing = rec
+            .stashes
+            .iter()
+            .filter(|s| !listed.contains(&s.commit))
+            .count() as u32;
+        Ok(RestorePreview {
+            head_then: rec.head_branch.clone(),
+            untracked_then: rec.untracked.len() as u32,
+            backup: rec,
+            moves,
+            head_now,
+            changed_now,
+            stashes_missing,
+        })
+    }
+
     /// Return the repository to the state recorded in backup `id`: branch and tag tips, HEAD,
     /// working tree (including files that were untracked) and index. A `restore` backup of the
     /// current state is taken first; if that fails nothing is changed.
@@ -495,11 +783,11 @@ impl Backups {
             .chain(rec.head_commit.as_deref())
             .chain(worktree.as_deref())
             .chain(rec.index_commit.as_deref())
+            .chain(rec.pending.iter().map(|p| p.commit.as_str()))
+            .chain(rec.stashes.iter().map(|st| st.commit.as_str()))
+            .chain(rec.conflicts.iter().filter_map(|l| l.split(' ').nth(1)))
         {
-            let ok = git(&self.root)
-                .args(["cat-file", "-e", c])
-                .output()?
-                .success();
+            let ok = self.git().args(["cat-file", "-e", c]).output()?.success();
             if !ok {
                 return Err(BackupError::Git(GitError::Read {
                     path: self.root.clone(),
@@ -525,7 +813,7 @@ impl Backups {
             updates.push_str(&format!("update refs/tags/{} {}\n", t.name, t.commit));
         }
         if !updates.is_empty() {
-            git(&self.root)
+            self.git()
                 .args(["update-ref", "--stdin"])
                 .stdin(updates)
                 .run()?;
@@ -534,25 +822,23 @@ impl Backups {
         // HEAD, then a clean working tree at it.
         match (&rec.head_branch, &rec.head_commit) {
             (Some(branch), _) => {
-                git(&self.root)
+                self.git()
                     .args(["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])
                     .run()?;
             }
             (None, Some(commit)) => {
-                git(&self.root)
+                self.git()
                     .args(["update-ref", "--no-deref", "HEAD", commit])
                     .run()?;
             }
             (None, None) => {}
         }
         if rec.head_commit.is_some() {
-            git(&self.root)
-                .args(["reset", "-q", "--hard", "HEAD"])
-                .run()?;
+            self.git().args(["reset", "-q", "--hard", "HEAD"]).run()?;
         } else {
-            git(&self.root).args(["read-tree", "--empty"]).run()?;
+            self.git().args(["read-tree", "--empty"]).run()?;
         }
-        git(&self.root).args(["clean", "-q", "-f", "-d"]).run()?;
+        self.git().args(["clean", "-q", "-f", "-d"]).run()?;
 
         // Working tree files from the snapshot.
         if let Some(wt) = &worktree {
@@ -561,11 +847,11 @@ impl Backups {
                 .join("pm")
                 .join(format!("restore-index-{}", std::process::id()));
             let result = (|| -> Result<(), BackupError> {
-                git(&self.root)
+                self.git()
                     .env("GIT_INDEX_FILE", &tmp_index)
                     .args(["read-tree", &format!("{wt}^{{tree}}")])
                     .run()?;
-                git_exact(&self.root)
+                self.git_exact()
                     .env("GIT_INDEX_FILE", &tmp_index)
                     .args(["checkout-index", "-a", "-f", "-q"])
                     .run()?;
@@ -575,7 +861,8 @@ impl Backups {
             result?;
             // Files in HEAD that were deleted in the working tree at backup time.
             if rec.head_commit.is_some() {
-                let gone = git(&self.root)
+                let gone = self
+                    .git()
                     .args([
                         "diff-tree",
                         "-r",
@@ -601,13 +888,13 @@ impl Backups {
         // The index as it was (files that were untracked stay untracked).
         match &rec.index_commit {
             Some(c) => {
-                git(&self.root)
+                self.git()
                     .args(["read-tree", &format!("{c}^{{tree}}")])
                     .run()?;
             }
             None => {
                 if rec.head_commit.is_some() {
-                    git(&self.root).args(["read-tree", "HEAD"]).run()?;
+                    self.git().args(["read-tree", "HEAD"]).run()?;
                 }
                 warnings.push(
                     "The index had unresolved conflicts when this backup was taken. The files are \
@@ -616,7 +903,64 @@ impl Backups {
                 );
             }
         }
-        let _ = git(&self.root)
+        if !rec.conflicts.is_empty() {
+            let mut info = Vec::new();
+            for line in &rec.conflicts {
+                info.extend_from_slice(line.as_bytes());
+                info.push(0);
+            }
+            self.git()
+                .args(["update-index", "-z", "--index-info"])
+                .stdin(info)
+                .run()?;
+        }
+
+        // The operation that was in progress, so it can be continued or aborted as before.
+        let merge_heads: Vec<&str> = rec
+            .pending
+            .iter()
+            .filter(|p| p.name == "MERGE_HEAD")
+            .map(|p| p.commit.as_str())
+            .collect();
+        if !merge_heads.is_empty() {
+            self.write_git_file("MERGE_HEAD", &format!("{}\n", merge_heads.join("\n")))?;
+        }
+        for p in rec.pending.iter().filter(|p| p.name != "MERGE_HEAD") {
+            if p.name == "CHERRY_PICK_HEAD" || p.name == "REVERT_HEAD" {
+                self.git().args(["update-ref", &p.name, &p.commit]).run()?;
+            }
+        }
+        if let Some(msg) = &rec.merge_msg {
+            self.write_git_file("MERGE_MSG", msg)?;
+        }
+        if let Some(mode) = &rec.merge_mode {
+            self.write_git_file("MERGE_MODE", mode)?;
+        }
+
+        // The stash list as it was, with stashes made since kept on top of it. `git stash store`
+        // only puts an entry on top, so when the list differs it is emptied and stored again,
+        // oldest first. Every commit stays reachable from the backups throughout.
+        let current = self.stashes()?;
+        let mut wanted: Vec<&StashTip> = current
+            .iter()
+            .filter(|c| !rec.stashes.iter().any(|st| st.commit == c.commit))
+            .collect();
+        wanted.extend(&rec.stashes);
+        if wanted
+            .iter()
+            .map(|st| &st.commit)
+            .ne(current.iter().map(|st| &st.commit))
+        {
+            self.git().args(["stash", "clear"]).run()?;
+            for st in wanted.iter().rev() {
+                self.git()
+                    .args(["stash", "store", "-m", &st.message, &st.commit])
+                    .run()?;
+            }
+        }
+
+        let _ = self
+            .git()
             .args(["update-index", "-q", "--refresh"])
             .output()?;
 
@@ -639,9 +983,9 @@ impl Backups {
         ];
         for (marker, args, what) in steps {
             if gd.join(marker).exists() {
-                let o = git(&self.root).args(*args).output()?;
+                let o = self.git().args(*args).output()?;
                 if !o.success() && *marker == "rebase-apply" {
-                    git(&self.root).args(["am", "--abort"]).run()?;
+                    self.git().args(["am", "--abort"]).run()?;
                 } else if !o.success() {
                     return Err(GitError::Failed {
                         command: o.command,
@@ -659,17 +1003,33 @@ impl Backups {
     }
 }
 
-/// A git command in `root` that never runs hooks. Backups must not trigger user hooks.
-fn git(root: &Path) -> GitCommand {
-    GitCommand::new(root).args(["-c", "core.hooksPath=/dev/null"])
-}
-
-/// For the commands that copy working-tree bytes into a snapshot and back. `core.autocrlf`
-/// (on by default in Git for Windows) would store CRLF files as LF and write LF files back as
-/// CRLF, so a restore would not give back the same bytes. Line-ending rules a repository sets in
-/// `.gitattributes` still apply, as they would to any checkout.
-fn git_exact(root: &Path) -> GitCommand {
-    git(root).args(["-c", "core.autocrlf=false"])
+/// `<git dir>/pm/no-hooks`, created empty if missing. Refuses anything that is not a regular
+/// file (a directory there could hold hooks; a symlink could point anywhere).
+fn no_hooks_file(git_dir: &Path) -> Result<PathBuf, BackupError> {
+    let dir = git_dir.join("pm");
+    std::fs::create_dir_all(&dir).map_err(|e| BackupError::io(&dir, e))?;
+    let path = dir.join("no-hooks");
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => Ok(path),
+        Ok(_) => Err(BackupError::io(
+            &path,
+            std::io::Error::other("expected an empty file here"),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .or_else(|e| match e.kind() {
+                    // Created by another open() at the same moment.
+                    std::io::ErrorKind::AlreadyExists => std::fs::File::open(&path),
+                    _ => Err(e),
+                })
+                .map_err(|e| BackupError::io(&path, e))?;
+            Ok(path)
+        }
+        Err(e) => Err(BackupError::io(&path, e)),
+    }
 }
 
 fn backup_identity(c: GitCommand) -> GitCommand {

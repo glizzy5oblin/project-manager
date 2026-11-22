@@ -117,6 +117,32 @@ fn restore_after_hard_reset_and_clean() {
 }
 
 #[test]
+fn preview_says_what_a_restore_would_change_and_changes_nothing() {
+    let r = messy();
+    let b = backups(&r);
+    let rec = b.create("reset-hard", &BackupOptions::default()).unwrap();
+    let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    // Nothing moved yet: only the dirty files are reported.
+    let p = b.preview(&rec.id).unwrap();
+    assert!(p.moves.is_empty(), "{:?}", p.moves);
+    assert_eq!(p.head_now.as_deref(), Some("main"));
+    assert_eq!(p.untracked_then, 1);
+    assert!(p.changed_now >= 3, "{}", p.changed_now);
+
+    r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    let before = fingerprint(&r);
+    let p = b.preview(&rec.id).unwrap();
+    assert_eq!(p.moves.len(), 1);
+    assert_eq!(
+        (p.moves[0].name.as_str(), p.moves[0].kind.as_str()),
+        ("main", "branch")
+    );
+    assert_eq!(p.moves[0].to, head);
+    assert!(p.moves[0].from.as_deref().is_some_and(|f| f != head));
+    assert_eq!(fingerprint(&r), before, "a preview changes nothing");
+}
+
+#[test]
 fn restore_is_itself_undoable() {
     let r = messy();
     let b = backups(&r);
@@ -180,18 +206,75 @@ fn unborn_repo_with_only_untracked_files() {
 }
 
 #[test]
-fn conflicted_merge_is_backed_up_with_a_warning() {
+fn conflicted_merge_is_restored_mid_merge() {
     let r = conflict();
+    // A file merged cleanly (staged by the merge) next to the conflicted one.
+    r.checkout("topic");
+    r.commit_file("clean.txt", "from topic\n", "topic adds a file");
+    r.checkout("main");
     start_conflict(&r);
-    let conflicted_text = r.read("conflict.txt");
+    let git_dir = r.path().join(".git");
+    let state = |r: &FixtureRepo| {
+        (
+            r.git(&["ls-files", "-s"]),
+            r.git(&["status", "--porcelain=v1", "--untracked-files=all"]),
+            r.read("conflict.txt"),
+            std::fs::read_to_string(git_dir.join("MERGE_HEAD")).ok(),
+            std::fs::read_to_string(git_dir.join("MERGE_MSG")).ok(),
+        )
+    };
+    let before = state(&r);
+    assert!(before.0.contains(" 3\tconflict.txt"), "{}", before.0);
+    assert!(before.1.contains("A  clean.txt"), "{}", before.1);
+
     let b = backups(&r);
-    let rec = b.create("merge-abort", &BackupOptions::default()).unwrap();
+    // With a bundle: it must also carry the refs that keep the conflicted blobs.
+    let opts = BackupOptions {
+        bundle_dir: Some(r.sibling("bundles")),
+    };
+    let rec = b.create("abort-merge", &opts).unwrap();
+    assert!(rec.bundle.is_some());
     assert!(rec.conflicted);
-    assert_eq!(rec.index_commit, None);
+    assert_eq!(rec.conflicts.len(), 3, "{:?}", rec.conflicts);
+    assert!(rec.index_commit.is_some());
+    assert_eq!(rec.pending.len(), 1);
+    assert_eq!(rec.pending[0].name, "MERGE_HEAD");
+    assert_eq!(rec.pending[0].commit, r.rev("topic"));
+
     r.git(&["merge", "--abort"]);
+    assert!(!git_dir.join("MERGE_HEAD").exists());
+    r.git(&["gc", "-q", "--prune=now"]);
+
     let out = b.restore(&rec.id, &BackupOptions::default()).unwrap();
-    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
-    assert_eq!(r.read("conflict.txt"), conflicted_text);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert_eq!(state(&r), before);
+    let s = crate::git::state::read_state(r.path(), true).unwrap();
+    assert_eq!(s.in_progress, Some(crate::git::state::Operation::Merge));
+    // The restored merge can be finished like the original.
+    r.write("conflict.txt", "resolved\n");
+    r.git(&["add", "conflict.txt"]);
+    r.git(&["commit", "-q", "--no-edit"]);
+    assert_eq!(r.parents("HEAD").len(), 2);
+}
+
+#[test]
+fn cherry_pick_in_progress_is_restored() {
+    let r = conflict();
+    let out = r
+        .command(r.path(), &["cherry-pick", "topic"])
+        .output()
+        .unwrap();
+    assert!(!out.success(), "fixture cherry-pick should conflict");
+    let pick = r.rev("CHERRY_PICK_HEAD");
+    let b = backups(&r);
+    let rec = b.create("abort", &BackupOptions::default()).unwrap();
+    assert_eq!(rec.pending.len(), 1);
+    assert_eq!(rec.pending[0].name, "CHERRY_PICK_HEAD");
+    let index = r.git(&["ls-files", "-s"]);
+    r.git(&["cherry-pick", "--abort"]);
+    b.restore(&rec.id, &BackupOptions::default()).unwrap();
+    assert_eq!(r.rev("CHERRY_PICK_HEAD"), pick);
+    assert_eq!(r.git(&["ls-files", "-s"]), index);
 }
 
 #[test]
@@ -378,6 +461,72 @@ fn lfs_files_round_trip() {
     r.git(&["clean", "-q", "-fd"]);
     b.restore(&rec.id, &BackupOptions::default()).unwrap();
     assert_eq!(fingerprint(&r), before);
+    // git-lfs installs hooks from its filters; none may land in the hooks path.
+    let no_hooks = r.path().join(".git/pm/no-hooks");
+    assert!(std::fs::symlink_metadata(&no_hooks).unwrap().is_file());
+    assert_eq!(std::fs::read(&no_hooks).unwrap(), b"");
+}
+
+/// Security: taking and restoring a backup must not run any repository hook, whether from
+/// `.git/hooks` or from a `core.hooksPath` the repository sets.
+#[cfg(unix)]
+#[test]
+fn backups_never_run_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = messy();
+    let marker = r.sibling("hooks-ran");
+    let custom = r.sibling("custom-hooks");
+    let names = [
+        "reference-transaction",
+        "post-checkout",
+        "post-index-change",
+        "pre-commit",
+        "post-commit",
+        "post-rewrite",
+        "pre-auto-gc",
+    ];
+    for dir in [r.path().join(".git/hooks"), custom.clone()] {
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            let hook = dir.join(name);
+            let script = format!("#!/bin/sh\necho {name} >> '{}'\n", marker.display());
+            std::fs::write(&hook, script).unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let round_trip = || {
+        let b = backups(&r);
+        let rec = b.create("reset-hard", &BackupOptions::default()).unwrap();
+        r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+        b.restore(&rec.id, &BackupOptions::default()).unwrap();
+        assert!(
+            !marker.exists(),
+            "hooks ran: {:?}",
+            std::fs::read_to_string(&marker)
+        );
+    };
+    // Control: a plain git command runs the hook, so the hooks are live.
+    let control = |what: &str| {
+        GitCommand::new(r.path())
+            .args(["update-ref", "refs/heads/hook-check", "HEAD"])
+            .run()
+            .unwrap();
+        assert!(marker.exists(), "control: {what} hooks did not run");
+        std::fs::remove_file(&marker).unwrap();
+    };
+
+    round_trip();
+    control(".git/hooks");
+    r.git(&["config", "core.hooksPath", custom.to_str().unwrap()]);
+    round_trip();
+    control("core.hooksPath");
+}
+
+#[test]
+fn a_directory_at_the_no_hooks_path_is_refused() {
+    let r = linear(2);
+    std::fs::create_dir_all(r.path().join(".git/pm/no-hooks")).unwrap();
+    assert!(Backups::open(r.path()).is_err());
 }
 
 /// Security: a restore must not write or delete through a symlink that points outside the repo.

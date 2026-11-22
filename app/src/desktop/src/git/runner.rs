@@ -99,6 +99,26 @@ impl GitOutput {
     pub fn success(&self) -> bool {
         self.code == Some(0)
     }
+    /// `Ok(self)` on exit code 0, otherwise the failure as an error carrying stderr (with a
+    /// sign-in hint when it was an authentication failure).
+    pub fn into_result(self) -> Result<GitOutput, GitError> {
+        if self.success() {
+            Ok(self)
+        } else if let Some(hint) = auth_failure_hint(&self.stderr) {
+            Err(GitError::AuthFailed {
+                command: self.command,
+                stderr: self.stderr.trim().to_string(),
+                hint,
+            })
+        } else {
+            Err(GitError::Failed {
+                command: self.command,
+                code: self.code,
+                stderr: self.stderr.trim().to_string(),
+            })
+        }
+    }
+
     /// Stdout as text, trailing newline removed.
     pub fn stdout_str(&self) -> String {
         String::from_utf8_lossy(&self.stdout)
@@ -185,22 +205,7 @@ impl GitCommand {
         cancel: &CancelToken,
         on_progress: impl FnMut(Progress),
     ) -> Result<GitOutput, GitError> {
-        let out = self.output_with(cancel, on_progress)?;
-        if out.success() {
-            Ok(out)
-        } else if let Some(hint) = auth_failure_hint(&out.stderr) {
-            Err(GitError::AuthFailed {
-                command: out.command,
-                stderr: out.stderr.trim().to_string(),
-                hint,
-            })
-        } else {
-            Err(GitError::Failed {
-                command: out.command,
-                code: out.code,
-                stderr: out.stderr.trim().to_string(),
-            })
-        }
+        self.output_with(cancel, on_progress)?.into_result()
     }
 
     /// Run to completion and return the output whatever the exit code.

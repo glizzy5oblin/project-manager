@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 pub use document::{ProjDocument, migrate};
 pub use schema::*;
+pub(crate) use validate::check_ref_name;
 
 /// Newest `schema_version` this build reads and writes.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;

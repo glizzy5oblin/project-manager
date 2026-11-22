@@ -15,7 +15,11 @@
     {/if}
     {#if error.detail}
         <details>
-            <summary>Details</summary>
+            <summary
+                title="Technical details you can pass on when asking for help"
+            >
+                Details
+            </summary>
             <pre>{error.detail}</pre>
         </details>
     {/if}

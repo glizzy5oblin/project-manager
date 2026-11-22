@@ -68,16 +68,17 @@ impl Registry {
             .ok_or_else(|| AppError::not_found(format!("No project with id {id:?}")))
     }
 
-    /// Register the repository at `root`. With `create` set and no `.proj` file present, a
-    /// starter `.proj` file for that workflow mode is written first. Adding a folder that is
-    /// already registered returns the existing entry.
+    /// Register the repository at `root`. A folder laid out the way [`create_project`] makes
+    /// projects (`<name>/private` and `<name>/public`) means its `private` repository. With
+    /// `create` set and no `.proj` file present, a starter `.proj` file for that workflow mode is
+    /// written first. Adding a folder that is already registered returns the existing entry.
     pub fn add(
         &mut self,
         root: &Path,
         create: Option<WorkflowMode>,
         now: u64,
     ) -> Result<ProjectEntry, AppError> {
-        let root = canonical_dir(root)?;
+        let root = project_root(canonical_dir(root)?);
         if let Some(existing) = self.data.projects.iter().find(|p| p.path == root) {
             return Ok(existing.clone());
         }
@@ -161,6 +162,26 @@ pub(crate) fn dunce_simplified(p: PathBuf) -> PathBuf {
     p
 }
 
+/// A folder that is itself a repository is the project. One that is not, but holds a `private`
+/// repository (the layout [`create_project`] makes), stands for that repository. Only a real
+/// folder counts, not a symlink, so the project never ends up outside the folder picked.
+fn project_root(root: PathBuf) -> PathBuf {
+    let is_repo = |p: &Path| crate::git::state::open(p).is_ok();
+    if is_repo(&root) {
+        return root;
+    }
+    let private = root.join("private");
+    if real_dir(&private) && is_repo(&private) {
+        private
+    } else {
+        root
+    }
+}
+
+fn real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+}
+
 /// Check that `root` is a non-bare git repository root holding one valid `.proj` file.
 pub fn inspect(root: &Path) -> Result<ProjFile, AppError> {
     match crate::git::state::open(root) {
@@ -186,18 +207,29 @@ pub fn inspect(root: &Path) -> Result<ProjFile, AppError> {
     Ok(ProjFile::load(&file)?)
 }
 
-/// Write `<folder>.proj` for an existing repository. Never overwrites a file.
+/// Write `<folder>.proj` for an existing repository. Never overwrites a file. In the
+/// `<name>/private` layout the project is called `<name>`, and its public repository is
+/// `../public` when that folder exists.
 fn write_starter_proj(root: &Path, mode: WorkflowMode) -> Result<ProjFile, AppError> {
-    let folder = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".into());
+    let file_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let split = file_name(root).as_deref() == Some("private");
+    let folder = if split {
+        root.parent().and_then(file_name)
+    } else {
+        file_name(root)
+    }
+    .unwrap_or_else(|| "project".into());
     let name = if validate_project_name(&folder).is_ok() {
         folder
     } else {
         "project".to_string()
     };
-    let public = format!("../{name}-public");
+    let sibling = root.parent().map(|p| p.join("public"));
+    let public = if split && sibling.as_deref().is_some_and(real_dir) {
+        "../public".to_string()
+    } else {
+        format!("../{name}-public")
+    };
     write_new_proj(root, &name, mode, &public)
 }
 

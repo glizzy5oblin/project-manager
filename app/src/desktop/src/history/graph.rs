@@ -14,7 +14,7 @@ use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use super::layout::{Layout, layout};
+use super::layout::{Layout, Recolor, layout_with};
 use crate::git::GitError;
 use crate::git::state::open;
 use crate::ipc::AppError;
@@ -29,6 +29,16 @@ pub enum RefKind {
     Branch,
     Remote,
     Tag,
+}
+
+/// A branch that was made from the commit this is attached to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchPoint {
+    pub name: String,
+    /// Colour index of the branch's own commits, as in [`GraphRow::color`].
+    pub color: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
@@ -95,6 +105,10 @@ pub struct GraphRow {
     /// Segments from this row's centre down to the next row's centre.
     pub edges: Vec<GraphEdge>,
     pub refs: Vec<RefLabel>,
+    /// Local branches that branched off here: following a branch's own first parents down from
+    /// its tip, this is the first commit another branch also points at (`main` for `dev`, when
+    /// `dev` was made from `main` and `main` has not moved). Sorted by name.
+    pub branched: Vec<BranchPoint>,
     pub parents: Vec<String>,
     pub subject: String,
     pub author_name: String,
@@ -111,7 +125,15 @@ pub struct GraphRow {
 pub struct GraphKey {
     pub options: GraphOptions,
     pub head: Option<ObjectId>,
+    /// The branch HEAD points at (`None` when detached). Checking out another branch at the
+    /// same commit changes only this, and the labels must still move.
+    pub head_ref: Option<String>,
     pub refs: Vec<(String, ObjectId)>,
+}
+
+fn head_ref(repo: &gix::Repository, path: &Path) -> Result<Option<String>, GitError> {
+    let name = repo.head_name().map_err(|e| read_err(path, e))?;
+    Ok(name.map(|n| n.as_bstr().to_string()))
 }
 
 pub struct Graph {
@@ -126,6 +148,8 @@ pub struct Graph {
     times: Vec<i64>,
     pub layout: Layout,
     labels: HashMap<u32, Vec<RefLabel>>,
+    /// See [`GraphRow::branched`].
+    branched: HashMap<u32, Vec<BranchPoint>>,
     head_row: Option<u32>,
     dim: Option<Vec<bool>>,
     all_refs: Vec<RefLabel>,
@@ -226,6 +250,7 @@ pub fn current_key(path: &Path, options: &GraphOptions) -> Result<GraphKey, GitE
     Ok(GraphKey {
         options: options.clone(),
         head: repo.head_id().ok().map(|i| i.detach()),
+        head_ref: head_ref(&repo, path)?,
         refs: refs.into_iter().map(|r| (r.label.full, r.commit)).collect(),
     })
 }
@@ -235,6 +260,80 @@ fn unknown_ref(path: &Path, name: &str) -> GitError {
         path: path.to_path_buf(),
         message: format!("there is no branch or tag named {name:?}"),
     }
+}
+
+/// Where each local branch branched off: from its tip, follow first parents to the first commit
+/// that another branch (local, or a remote-tracking branch of another name) points at, and note the
+/// branch there. A branch whose tip is itself shared with another branch has no such point, and
+/// neither has one whose history never meets another branch. The graph cannot show this as a
+/// second lane while the other branch has no commits of its own.
+fn branch_points(
+    labels: &HashMap<u32, Vec<RefLabel>>,
+    parent_start: &[u32],
+    parents: &[u32],
+) -> HashMap<u32, Vec<(String, u32)>> {
+    let others = |row: u32, name: &str| {
+        labels.get(&row).is_some_and(|ls| {
+            ls.iter().any(|l| match l.kind {
+                RefKind::Branch => l.name != name,
+                // `origin/dev` is `dev` itself, not another branch.
+                RefKind::Remote => !l.name.ends_with(&format!("/{name}")),
+                RefKind::Tag | RefKind::Head => false,
+            })
+        })
+    };
+    let mut out: HashMap<u32, Vec<(String, u32)>> = HashMap::new();
+    for (&tip, ls) in labels {
+        for b in ls.iter().filter(|l| l.kind == RefKind::Branch) {
+            if others(tip, &b.name) {
+                continue;
+            }
+            let mut row = tip as usize;
+            while let Some(&p) = parents
+                .get(parent_start[row] as usize..parent_start[row + 1] as usize)
+                .and_then(<[u32]>::first)
+            {
+                if others(p, &b.name) {
+                    out.entry(p).or_default().push((b.name.clone(), tip));
+                    break;
+                }
+                row = p as usize;
+            }
+        }
+    }
+    for v in out.values_mut() {
+        v.sort();
+    }
+    out
+}
+
+/// The rows of the main branch: the local branch `main` (else `master`) and its first parents,
+/// all the way down. Empty when the graph has neither.
+fn main_chain(
+    labels: &HashMap<u32, Vec<RefLabel>>,
+    parent_start: &[u32],
+    parents: &[u32],
+    rows: usize,
+) -> Vec<bool> {
+    let mut chain = vec![false; rows];
+    let tip = ["main", "master"].iter().find_map(|name| {
+        labels
+            .iter()
+            .find(|(_, ls)| {
+                ls.iter()
+                    .any(|l| l.kind == RefKind::Branch && l.name == *name)
+            })
+            .map(|(&row, _)| row as usize)
+    });
+    let mut row = tip;
+    while let Some(r) = row {
+        chain[r] = true;
+        row = parents
+            .get(parent_start[r] as usize..parent_start[r + 1] as usize)
+            .and_then(<[u32]>::first)
+            .map(|&p| p as usize);
+    }
+    chain
 }
 
 /// Build the graph. Unknown ref names in `options` are an error.
@@ -328,10 +427,6 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
         .map(|(i, id)| (*id, i as u32))
         .collect();
 
-    let lay = layout(n, |r| {
-        parents[parent_start[r] as usize..parent_start[r + 1] as usize].to_vec()
-    });
-
     let mut labels: HashMap<u32, Vec<RefLabel>> = HashMap::new();
     for r in &refs {
         if let Some(&row) = index.get(&r.commit) {
@@ -343,11 +438,46 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
         v.sort_by_key(|l| (!l.is_head, l.kind as u8, l.name.clone()));
     }
 
+    let branched = branch_points(&labels, &parent_start, &parents);
+
+    // The main branch is colour 0 (blue in the default themes) all the way down. The commit a
+    // branch branched from starts a new colour, so the branch's own commits above it look
+    // different from the branch it was made from even when they share a lane.
+    let main = main_chain(&labels, &parent_start, &parents, n);
+    let lay = layout_with(
+        n,
+        |r| parents[parent_start[r] as usize..parent_start[r + 1] as usize].to_vec(),
+        main.iter().any(|&m| m),
+        |r| {
+            if main[r] {
+                Recolor::Main
+            } else if branched.contains_key(&(r as u32)) {
+                Recolor::New
+            } else {
+                Recolor::Keep
+            }
+        },
+    );
+    let branched = branched
+        .into_iter()
+        .map(|(row, names)| {
+            let points = names
+                .into_iter()
+                .map(|(name, tip)| BranchPoint {
+                    name,
+                    color: lay.color[tip as usize],
+                })
+                .collect();
+            (row, points)
+        })
+        .collect();
+
     let mut graph = Graph {
         generation,
         key: GraphKey {
             options: options.clone(),
             head,
+            head_ref: head_ref(&repo, path)?,
             refs: refs
                 .iter()
                 .map(|r| (r.label.full.clone(), r.commit))
@@ -362,6 +492,7 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
         times,
         layout: lay,
         labels,
+        branched,
         dim: None,
         all_refs: refs.into_iter().map(|r| r.label).collect(),
     };
@@ -570,6 +701,7 @@ impl Graph {
                         })
                         .collect(),
                     refs: self.labels(r as u32).to_vec(),
+                    branched: self.branched.get(&(r as u32)).cloned().unwrap_or_default(),
                     parents: self
                         .parents_of(r)
                         .iter()

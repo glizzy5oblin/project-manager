@@ -8,25 +8,34 @@
     import type { FileStatus } from "../bindings/FileStatus";
     import type { RefLabel } from "../bindings/RefLabel";
     import { formatOffset, formatTime, shortId } from "../history";
+    import type { HeadState } from "../bindings/HeadState";
     import BlameView from "./BlameView.svelte";
+    import CommitActions from "./CommitActions.svelte";
     import DiffView from "./DiffView.svelte";
     import ErrorBox from "./ErrorBox.svelte";
+    import Splitter from "./Splitter.svelte";
 
     let {
         projectId,
         commit,
         refs,
+        head,
         diffMode = $bindable("unified"),
         onjump,
         onhistory,
+        onclose,
     }: {
         projectId: string;
         commit: string;
         refs: RefLabel[];
+        /** The repository's HEAD, for the write actions. */
+        head: HeadState | null;
         diffMode?: "unified" | "split";
         onjump: (commit: string) => void;
         /** Show the history of one file. */
         onhistory: (path: string) => void;
+        /** Close the panel. */
+        onclose: () => void;
     } = $props();
 
     let detail = $state<CommitDetail | null>(null);
@@ -77,6 +86,40 @@
                   .trimEnd()
             : "",
     );
+    // Pane sizes as fractions of the panel (Splitter): the width of the details beside the diff,
+    // or their height above it when the panel is narrow. Null is the default.
+    let layout = $state<HTMLDivElement>();
+    let layoutW = $state(0);
+    let layoutH = $state(0);
+    let infoPxW = $state(0);
+    let infoPxH = $state(0);
+    // The details never get narrower than their label column and text need, nor does the diff.
+    const INFO_MIN = 480;
+    const VIEW_MIN = 320;
+    let infoW = $state<number | null>(null);
+    // The details widen by themselves when a button row or text field would be cut off. This is
+    // the width the content asked for; the 480px minimum stays as the floor.
+    let infoEl = $state<HTMLDivElement>();
+    let needW = $state(0);
+    const infoMin = $derived(Math.max(INFO_MIN, needW));
+    $effect(() => {
+        // Measure again when the commit, its branches or the width change.
+        void [commit, refs, detail, infoPxW];
+        const el = infoEl;
+        if (!el) return;
+        const frame = requestAnimationFrame(() => {
+            const over = el.scrollWidth - el.clientWidth;
+            if (over > 1) needW = Math.max(needW, el.clientWidth + over);
+        });
+        return () => cancelAnimationFrame(frame);
+    });
+    // A different commit starts from the minimum again.
+    $effect(() => {
+        void commit;
+        needW = 0;
+    });
+    let infoH = $state<number | null>(null);
+
     const sameCommitter = $derived(
         detail !== null &&
             detail.author.name === detail.committer.name &&
@@ -85,9 +128,41 @@
     );
 </script>
 
-<div class="panel">
-    <div class="layout">
-        <div class="info">
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions (Escape closes the panel from anywhere inside it, except while a form is open) -->
+<div
+    class="panel"
+    role="region"
+    aria-label="Commit details"
+    onkeydown={(e) => {
+        if (e.key === "Escape" && !e.defaultPrevented) onclose();
+    }}
+>
+    <button
+        type="button"
+        class="close"
+        title="Close the commit details (Esc)"
+        aria-label="Close the commit details"
+        onclick={onclose}
+    >
+        ✕
+    </button>
+    <div
+        class="layout"
+        bind:this={layout}
+        bind:clientWidth={layoutW}
+        bind:clientHeight={layoutH}
+        style:--info={infoW === null
+            ? `clamp(${infoMin}px, 42%, 32rem)`
+            : `clamp(${infoMin}px, ${infoW * 100}%, calc(100% - ${VIEW_MIN}px))`}
+    >
+        <div
+            class="info"
+            bind:this={infoEl}
+            class:sized={infoH !== null}
+            bind:clientWidth={infoPxW}
+            bind:clientHeight={infoPxH}
+            style:height={infoH === null ? undefined : `${infoH * layoutH}px`}
+        >
             {#if error}
                 <ErrorBox {error} />
             {:else if detail}
@@ -121,6 +196,7 @@
                     <dd>
                         {#each detail.parents as p (p)}
                             <button
+                                title={`Go to the parent commit ${shortId(p)}`}
                                 type="button"
                                 class="link"
                                 onclick={() => onjump(p)}
@@ -136,10 +212,12 @@
                         <dd>{refs.map((r) => r.name).join(", ")}</dd>
                     {/if}
                 </dl>
+                <CommitActions {projectId} commit={detail.id} {refs} {head} />
                 {#if detail.parents.length > 1}
                     <label class="compare">
                         Compare with
                         <select
+                            title="Choose which parent this merge commit is compared with"
                             value={detail.comparedParent ?? 0}
                             onchange={(e) => (parent = +e.currentTarget.value)}
                         >
@@ -162,6 +240,7 @@
                     {#each detail.files as f (f.path)}
                         <li>
                             <button
+                                title={`Show the changes made to ${f.path}`}
                                 type="button"
                                 class="file"
                                 class:current={file?.path === f.path}
@@ -179,7 +258,7 @@
                                 <span
                                     class="name"
                                     title={f.oldPath
-                                        ? `${f.oldPath} → $<bdi>{f.path}</bdi>`
+                                        ? `${f.oldPath} → ${f.path}`
                                         : f.path}
                                 >
                                     {f.path}
@@ -199,10 +278,37 @@
             {/if}
         </div>
 
+        <!-- Side by side the line is vertical; stacked (a narrow panel) it is horizontal. -->
+        <Splitter
+            box={layout}
+            axis="x"
+            bind:value={infoW}
+            current={layoutW ? infoPxW / layoutW : 0.4}
+            min={0.15}
+            max={0.75}
+            minPx={infoMin}
+            endMinPx={VIEW_MIN}
+            label="Resize the commit details"
+            storageKey="commit.info"
+        />
+        <Splitter
+            box={layout}
+            axis="y"
+            bind:value={infoH}
+            current={layoutH ? infoPxH / layoutH : 0.4}
+            min={0.1}
+            max={0.8}
+            minPx={128}
+            endMinPx={160}
+            label="Resize the commit details"
+            storageKey="commit.info.stacked"
+        />
+
         <div class="view">
             {#if file && detail}
                 <div class="tabs" role="tablist">
                     <button
+                        title="Show what this commit changed in the file"
                         type="button"
                         role="tab"
                         aria-selected={tab === "diff"}
@@ -225,6 +331,7 @@
                         Blame
                     </button>
                     <button
+                        title="List every commit that changed this file"
                         type="button"
                         onclick={() => file && onhistory(file.path)}
                     >
@@ -256,22 +363,45 @@
 
 <style>
     /* Lays out by its own width, not the window's: the project sidebar takes part of the window. */
+    .close {
+        position: absolute;
+        z-index: 2;
+        top: 0.3rem;
+        right: 0.6rem;
+        padding: 0.05rem 0.4rem;
+        border-color: transparent;
+        background: var(--surface);
+        color: var(--text-muted);
+        font-size: 0.85rem;
+    }
+    .close:hover {
+        color: var(--text);
+    }
     .panel {
+        position: relative;
         container-type: inline-size;
         height: 100%;
         min-height: 0;
     }
     .layout {
         display: grid;
-        grid-template-columns: clamp(15rem, 42%, 28rem) minmax(0, 1fr);
+        grid-template-columns: var(--info) 6px minmax(0, 1fr);
+        grid-template-areas: "info line view";
         height: 100%;
         min-height: 0;
     }
     .info {
+        grid-area: info;
         min-height: 0;
+        min-width: 0;
         padding: 0.6rem 0.75rem;
         overflow: auto;
-        border-right: 1px solid var(--border);
+    }
+    .layout > :global(.splitter.x) {
+        grid-area: line;
+    }
+    .layout > :global(.splitter.y) {
+        display: none;
     }
     h3 {
         margin: 0 0 0.4rem;
@@ -382,6 +512,7 @@
         color: var(--danger);
     }
     .view {
+        grid-area: view;
         display: flex;
         flex-direction: column;
         min-width: 0;
@@ -405,13 +536,22 @@
     }
     @container (max-width: 34rem) {
         .layout {
-            grid-template-columns: 1fr;
-            grid-template-rows: auto 1fr;
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: auto 6px minmax(0, 1fr);
+            grid-template-areas: "info" "line" "view";
         }
         .info {
             max-height: 40%;
-            border-right: none;
-            border-bottom: 1px solid var(--border);
+        }
+        .info.sized {
+            max-height: 80%;
+        }
+        .layout > :global(.splitter.x) {
+            display: none;
+        }
+        .layout > :global(.splitter.y) {
+            display: block;
+            grid-area: line;
         }
     }
 </style>

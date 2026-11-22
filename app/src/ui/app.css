@@ -74,7 +74,12 @@ select {
     font: inherit;
 }
 
+/* No control is squeezed: a button keeps its label on one line and its full width, and a field or
+   select keeps a usable width. Containers that must shrink (list rows, cards, tabs) say so
+   themselves with `min-width: 0` and an ellipsis. */
 button {
+    flex-shrink: 0;
+    white-space: nowrap;
     padding: 0.4rem 0.8rem;
     border: 1px solid var(--border);
     border-radius: 5px;
@@ -102,6 +107,15 @@ button.danger {
     border-color: var(--danger);
     background: var(--danger);
     color: var(--accent-text);
+}
+
+input:not([type="checkbox"], [type="radio"], [type="range"]),
+select {
+    min-width: 6rem;
+}
+
+textarea {
+    min-width: 10rem;
 }
 
 input,

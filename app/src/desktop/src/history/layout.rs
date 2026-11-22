@@ -13,7 +13,25 @@
 //! - Other parents (merge sources) join a lane already waiting for them, or open a new lane,
 //!   preferably to the right of the commit.
 //! - Lanes are never shifted; freed lanes are reused, so lines stay straight.
-//! - Each lane run gets a colour index when it opens and keeps it to the end.
+//! - Each lane run gets a colour index when it opens and keeps it to the end, except at a
+//!   recoloured row: the lane continues there in a new colour (so a branch that shares its lane
+//!   with the branch it was made from still looks different from it), or in colour 0 for the
+//!   main branch's own commits. Colours count up and wrap around the theme's palette; when
+//!   colour 0 is reserved for the main branch, other lanes never get it.
+
+/// Colours in the theme's graph palette (`--graph-1..8`); colour index `c` is `--graph-(c % 8 + 1)`.
+pub const PALETTE: u16 = 8;
+
+/// What a row does to the colour of its lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recolor {
+    /// Keep the lane's colour.
+    Keep,
+    /// The commit, and what lies below it in its lane, takes a new colour.
+    New,
+    /// The commit is on the main branch: colour 0.
+    Main,
+}
 
 /// A line segment from (`from`, row) to (`to`, row + 1), in lane units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +78,17 @@ impl Layout {
 /// than `r` (parents are listed below their children). Parents outside the set are left out by
 /// the caller.
 pub fn layout(rows: usize, parents: impl Fn(usize) -> Vec<u32>) -> Layout {
+    layout_with(rows, parents, false, |_| Recolor::Keep)
+}
+
+/// [`layout`] with rows that recolour their lane. The segment arriving from above keeps the old
+/// colour. With `reserve_main`, only `Recolor::Main` rows get colour 0.
+pub fn layout_with(
+    rows: usize,
+    parents: impl Fn(usize) -> Vec<u32>,
+    reserve_main: bool,
+    recolor: impl Fn(usize) -> Recolor,
+) -> Layout {
     let mut out = Layout {
         lane: Vec::with_capacity(rows),
         color: Vec::with_capacity(rows),
@@ -77,6 +106,9 @@ pub fn layout(rows: usize, parents: impl Fn(usize) -> Vec<u32>) -> Layout {
     let mut joins: Vec<(u16, u16, u16)> = Vec::new();
     let mut next_color: u16 = 0;
     let mut new_color = || {
+        if reserve_main && next_color.is_multiple_of(PALETTE) {
+            next_color = next_color.wrapping_add(1);
+        }
         let c = next_color;
         next_color = next_color.wrapping_add(1);
         c
@@ -123,6 +155,11 @@ pub fn layout(rows: usize, parents: impl Fn(usize) -> Vec<u32>) -> Layout {
             out.edge_start.push(out.edges.len() as u32);
         }
         joins.clear();
+        match recolor(r) {
+            Recolor::Keep => {}
+            Recolor::New => colors[node] = new_color(),
+            Recolor::Main => colors[node] = 0,
+        }
 
         out.lane.push(node16);
         out.color.push(colors[node]);

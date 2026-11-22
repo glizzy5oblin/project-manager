@@ -32,6 +32,9 @@ pub struct RepoState {
     /// `None` for bare repositories.
     pub status: Option<StatusSummary>,
     pub in_progress: Option<Operation>,
+    /// The commit message git prepared for the merge in progress (`MERGE_MSG`), without its
+    /// `#` comment lines, for the commit editor to start from. `None` outside a merge.
+    pub merge_message: Option<String>,
     /// `.gitmodules` exists. Submodules are detected and warned about only (agreed policy).
     pub has_submodules: bool,
 }
@@ -281,6 +284,12 @@ pub fn read_state(path: &Path, with_status: bool) -> Result<RepoState, GitError>
         }
     });
 
+    let merge_message = if in_progress == Some(Operation::Merge) {
+        read_merge_message(repo.git_dir())
+    } else {
+        None
+    };
+
     Ok(RepoState {
         has_submodules: repo
             .workdir()
@@ -295,7 +304,26 @@ pub fn read_state(path: &Path, with_status: bool) -> Result<RepoState, GitError>
         remotes,
         status,
         in_progress,
+        merge_message,
     })
+}
+
+/// Largest `MERGE_MSG` shown in the editor; a bigger one is left out.
+const MERGE_MSG_LIMIT: u64 = 64 * 1024;
+
+/// `MERGE_MSG` without its comment lines. Only a regular file is read, so a symlink planted in
+/// the git dir cannot make the app show another file's contents.
+fn read_merge_message(git_dir: &Path) -> Option<String> {
+    let path = git_dir.join("MERGE_MSG");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MERGE_MSG_LIMIT {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    let msg = kept.join("\n").trim().to_string();
+    (!msg.is_empty()).then_some(msg)
 }
 
 /// The full name of a branch's upstream: the remote-tracking ref for a normal remote, or the

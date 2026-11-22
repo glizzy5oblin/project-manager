@@ -140,6 +140,7 @@
         <div class="code">
             <output aria-label="Sign-in code">{pending.prompt.userCode}</output>
             <button
+                title="Copy the one-time code so you can paste it on GitHub"
                 type="button"
                 onclick={() => copy(pending!.prompt.userCode)}
             >
@@ -227,8 +228,15 @@
 
     {#snippet actions()}
         {#if pending}
-            <button type="button" onclick={close}>Cancel</button>
             <button
+                title="Stop signing in. Nothing is saved"
+                type="button"
+                onclick={close}
+            >
+                Cancel
+            </button>
+            <button
+                title="Open GitHub in your browser, where you type in the code"
                 type="button"
                 class="primary"
                 onclick={() => open(pending!.prompt.verificationUri)}
@@ -236,19 +244,34 @@
                 Open GitHub
             </button>
         {:else if account}
-            <button type="button" onclick={close}>Close</button>
-            <button type="button" onclick={signOut} disabled={busy}>
+            <button title="Close this window" type="button" onclick={close}>
+                Close
+            </button>
+            <button
+                title="Forget the GitHub account this app uses. Your GitHub account itself is not changed"
+                type="button"
+                onclick={signOut}
+                disabled={busy}
+            >
                 Sign out
             </button>
         {:else}
-            <button type="button" onclick={close}>Close</button>
+            <button title="Close this window" type="button" onclick={close}>
+                Close
+            </button>
             {#if status && !status.canSignIn && !gh?.signedIn}
-                <button type="button" onclick={refresh} disabled={busy}>
+                <button
+                    title="Look again for the GitHub CLI and its login"
+                    type="button"
+                    onclick={refresh}
+                    disabled={busy}
+                >
                     Check again
                 </button>
             {/if}
             {#if gh?.signedIn}
                 <button
+                    title="Use the GitHub account the gh command-line tool is already signed in to"
                     type="button"
                     class={status?.canSignIn ? "" : "primary"}
                     onclick={useGh}
@@ -259,6 +282,7 @@
             {/if}
             {#if status?.canSignIn}
                 <button
+                    title="Sign in through your browser. You get a short code to type in on GitHub"
                     type="button"
                     class="primary"
                     onclick={signIn}

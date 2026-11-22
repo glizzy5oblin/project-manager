@@ -188,7 +188,7 @@ fn check_relative(p: &str) -> Result<(), String> {
 }
 
 /// The main rules of `git check-ref-format` for a branch name.
-fn check_ref_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_ref_name(name: &str) -> Result<(), String> {
     let bad = |why: &str| Err(format!("\"{name}\" is not a valid branch name: {why}"));
     if name.is_empty() {
         return Err("must not be empty".into());

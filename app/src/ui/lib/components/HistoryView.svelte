@@ -2,26 +2,32 @@
     // The commit graph and log: one virtualised list (only visible rows exist in the DOM, rows
     // load in chunks), with the graph drawn on a canvas beside it in graph mode. In log mode a
     // search filters the list; in graph mode it fades the commits that do not match.
-    import { onMount, untrack } from "svelte";
+    import { untrack } from "svelte";
+    import { actions } from "../actions.svelte";
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { GraphInfo } from "../bindings/GraphInfo";
     import type { GraphOptions } from "../bindings/GraphOptions";
     import type { GraphRow } from "../bindings/GraphRow";
+    import type { HeadState } from "../bindings/HeadState";
     import type { LogQuery } from "../bindings/LogQuery";
     import type { RefLabel } from "../bindings/RefLabel";
-    import { drawGraph, prepareCanvas } from "../graphDraw";
+    import { commitCommands, commitMenu } from "../commitMenu.svelte";
+    import { offerMenu } from "../contextMenu";
+    import { graphShapes } from "../graphShapes";
     import {
         RowCache,
         dayEnd,
         dayStart,
         formatTime,
+        graphColorVar,
         graphWidth,
         lowerBound,
         scrollToShow,
         shortId,
         visibleRange,
     } from "../history";
+    import ColumnHandle from "./ColumnHandle.svelte";
     import ErrorBox from "./ErrorBox.svelte";
 
     let {
@@ -29,6 +35,7 @@
         active,
         changed,
         showGraph,
+        head = null,
         selected = $bindable(null),
         selectedRefs = $bindable([]),
         path = $bindable(""),
@@ -38,6 +45,8 @@
         /** Bumped when the project's files change on disk. */
         changed: number;
         showGraph: boolean;
+        /** Where HEAD is, for the git actions in the right-click menu. */
+        head?: HeadState | null;
         /** Selected commit id, shared with the detail panel. */
         selected?: string | null;
         selectedRefs?: RefLabel[];
@@ -56,7 +65,6 @@
     let loadedFor = -1;
 
     let scroller = $state<HTMLDivElement>();
-    let canvas = $state<HTMLCanvasElement>();
     let scrollTop = $state(0);
     let viewH = $state(0);
     let rowHeight = $state(26);
@@ -185,8 +193,31 @@
     const matches = $derived(
         showGraph && searchRows ? new Set(searchRows) : null,
     );
+    // Wide enough for the "Graph" heading however few lanes there are.
+    const GRAPH_MIN = 48;
+    /** Width of the column header row, which is as wide as the list. */
+    let listW = $state(0);
+    /** The graph column's width when the user has dragged it; null follows the lane count. */
+    let graphW = $state<number | null>(null);
     const gw = $derived(
-        showGraph && info ? graphWidth(info.maxLanes, laneWidth) : 0,
+        showGraph && info
+            ? Math.max(
+                  GRAPH_MIN,
+                  graphW !== null
+                      ? Math.min(graphW, Math.round(listW * 0.6))
+                      : graphWidth(info.maxLanes, laneWidth),
+              )
+            : 0,
+    );
+    // Lanes squeeze together when there are more than the column has room for, so none are cut
+    // off at the edge. Never thinner than 3px.
+    const lw = $derived(
+        info
+            ? Math.min(
+                  laneWidth,
+                  Math.max(3, (gw - 12) / Math.max(1, info.maxLanes)),
+              )
+            : laneWidth,
     );
     const range = $derived(visibleRange(scrollTop, viewH, rowHeight, count, 8));
     const visible = $derived.by(() => {
@@ -197,20 +228,20 @@
         return out;
     });
 
-    $effect(() => {
+    // The graph is one SVG inside the scrolled list, so it scrolls with the rows as ordinary
+    // content. (A canvas laid over the list and redrawn on scroll left stale strips of earlier
+    // frames on screen in WebKitGTK.) It is placed at the first row it covers and only changes
+    // when that range does, not on every scroll event.
+    const graphFirst = $derived(range[0]);
+    const graphLast = $derived(range[1]);
+    const shapes = $derived.by(() => {
         void version;
-        if (!showGraph || !canvas || !info || viewH <= 0) return;
-        const ctx = prepareCanvas(canvas, gw, viewH);
-        if (!ctx) return;
-        const [first, last] = visibleRange(scrollTop, viewH, rowHeight, count);
-        drawGraph(ctx, {
-            first,
-            last,
-            scrollTop,
+        if (!showGraph || !info) return null;
+        return graphShapes({
+            first: graphFirst,
+            last: graphLast,
             rowHeight,
-            laneWidth,
-            width: gw,
-            height: viewH,
+            laneWidth: lw,
             rowAt: (i) => cache?.get(i),
             selectedRow,
             headRow: info.headRow,
@@ -218,27 +249,56 @@
         });
     });
 
-    // Redraw when the theme changes (it sets variables on <html>) or the pixel ratio changes
-    // (moving the window to another display, or browser zoom).
-    onMount(() => {
-        const mo = new MutationObserver(() => version++);
-        mo.observe(document.documentElement, { attributes: true });
-        let mq: MediaQueryList | null = null;
-        const watchDpr = () => {
-            mq?.removeEventListener("change", onDpr);
-            mq = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-            mq.addEventListener("change", onDpr);
-        };
-        const onDpr = () => {
-            version++;
-            watchDpr();
-        };
-        watchDpr();
-        return () => {
-            mo.disconnect();
-            mq?.removeEventListener("change", onDpr);
-        };
-    });
+    // ---- columns ----
+
+    // Widths in pixels of the Author, Date and Commit columns, which sit against the right edge
+    // (the description takes the rest). Null is the default width (see the CSS).
+    let authorW = $state<number | null>(null);
+    let dateW = $state<number | null>(null);
+    let shaW = $state<number | null>(null);
+    /** No column takes more than this, so the description keeps room. */
+    const maxCol = $derived(Math.max(120, Math.round(listW * 0.4)));
+    const cols = $derived(
+        [
+            authorW !== null && `--c-author:${Math.min(authorW, maxCol)}px`,
+            dateW !== null && `--c-date:${Math.min(dateW, maxCol)}px`,
+            shaW !== null && `--c-sha:${Math.min(shaW, maxCol)}px`,
+        ]
+            .filter(Boolean)
+            .join(";"),
+    );
+
+    // ---- right-click menu ----
+
+    /** Select the commit and offer its git actions (the panel beside the list runs them). */
+    function rowMenu(e: MouseEvent, r: GraphRow) {
+        selectRow(r);
+        const menu = commitMenu({
+            commit: r.id,
+            subject: r.subject,
+            refs: r.refs,
+            head,
+            busy: !!actions.busy[id],
+        });
+        offerMenu(e, {
+            items: menu.items,
+            run: (item) => {
+                const command = menu.commands[item];
+                if (command.type === "copy") {
+                    void navigator.clipboard.writeText(command.text);
+                } else {
+                    commitCommands.request = { commit: r.id, command };
+                }
+            },
+        });
+    }
+
+    /** The menu key or Shift+F10 on the list itself: the menu of the selected commit. */
+    function listMenu(e: MouseEvent) {
+        if (e.target !== e.currentTarget || selectedRow === null) return;
+        const r = cache?.get(selectedRow);
+        if (r) rowMenu(e, r);
+    }
 
     // ---- selection ----
 
@@ -385,149 +445,169 @@
 <div class="history-view">
     <div class="toolbar">
         <div class="group">
-            <input
-                type="search"
-                placeholder="Message"
-                aria-label="Search messages"
-                bind:value={qMessage}
-            />
-            <input
-                type="search"
-                placeholder="Author"
-                aria-label="Search authors"
-                bind:value={qAuthor}
-            />
-            <input
-                type="search"
-                placeholder="Path"
-                title="Only commits that change this file or folder"
-                aria-label="Only commits that change this path"
-                bind:value={path}
-            />
-            <button
-                type="button"
-                class:on={showFilters}
-                aria-expanded={showFilters}
-                disabled={extraFilters > 0}
-                title={extraFilters > 0
-                    ? "Clear the date and branch filters to hide them"
-                    : "Filter by date or branch"}
-                onclick={() => (filtersOpen = !filtersOpen)}
-            >
-                Filters{extraFilters > 0 ? ` (${extraFilters})` : ""}
-            </button>
-            {#if queryActive}
-                <button type="button" onclick={clearSearch}>Clear</button>
-            {/if}
-            <span class="status" aria-live="polite">
-                {#if searching}
-                    Searching…
-                {:else if searchRows}
-                    {searchRows.length} match{searchRows.length === 1
-                        ? ""
-                        : "es"}
+            <div class="side">
+                {#if showGraph}
+                    <label>
+                        Show
+                        <select
+                            title="Choose which branches are drawn in the graph"
+                            value={showValue}
+                            onchange={(e) => setShow(e.currentTarget.value)}
+                        >
+                            <option value="">All branches</option>
+                            {#if info?.workflowRefs.length}
+                                <option value={WORKFLOW}>
+                                    Private and public branches
+                                </option>
+                            {/if}
+                            {#each refChoices as r (r.full)}
+                                <option value={r.full}>{r.name}</option>
+                            {/each}
+                        </select>
+                    </label>
+                    <label>
+                        Highlight
+                        <select
+                            title="Colour the commits of one branch so they stand out"
+                            value={options.highlight ?? ""}
+                            onchange={(e) =>
+                                setOptions({
+                                    highlight: e.currentTarget.value || null,
+                                })}
+                        >
+                            <option value="">Nothing</option>
+                            {#each info?.refs ?? [] as r (r.full)}
+                                <option value={r.full}>{r.name}</option>
+                            {/each}
+                        </select>
+                    </label>
+                    <label class="lane">
+                        Lanes
+                        <input
+                            title="Make the graph lines wider or narrower"
+                            class="lanes"
+                            type="range"
+                            min="8"
+                            max="28"
+                            step="2"
+                            aria-label="Lane width"
+                            bind:value={laneWidth}
+                        />
+                    </label>
                 {/if}
-            </span>
-            {#if showGraph && searchRows && searchRows.length > 0}
-                <button
-                    type="button"
-                    onclick={() => nextMatch(-1)}
-                    aria-label="Previous match"
+                <select
+                    title="How tall each commit row is"
+                    aria-label="Row size"
+                    bind:value={rowHeight}
                 >
-                    ↑
-                </button>
-                <button
-                    type="button"
-                    onclick={() => nextMatch(1)}
-                    aria-label="Next match"
+                    {#each zooms as z (z.h)}
+                        <option value={z.h}>{z.label}</option>
+                    {/each}
+                </select>
+                <form
+                    class="goto"
+                    onsubmit={(e) => {
+                        e.preventDefault();
+                        void goto();
+                    }}
                 >
-                    ↓
-                </button>
-            {/if}
-        </div>
-        <div class="group">
-            {#if showGraph}
-                <label>
-                    Show
-                    <select
-                        value={showValue}
-                        onchange={(e) => setShow(e.currentTarget.value)}
-                    >
-                        <option value="">All branches</option>
-                        {#if info?.workflowRefs.length}
-                            <option value={WORKFLOW}>
-                                Private and public branches
-                            </option>
-                        {/if}
-                        {#each refChoices as r (r.full)}
-                            <option value={r.full}>{r.name}</option>
-                        {/each}
-                    </select>
-                </label>
-                <label>
-                    Highlight
-                    <select
-                        value={options.highlight ?? ""}
-                        onchange={(e) =>
-                            setOptions({
-                                highlight: e.currentTarget.value || null,
-                            })}
-                    >
-                        <option value="">Nothing</option>
-                        {#each info?.refs ?? [] as r (r.full)}
-                            <option value={r.full}>{r.name}</option>
-                        {/each}
-                    </select>
-                </label>
-                <label>
-                    Lanes
                     <input
-                        class="lanes"
-                        type="range"
-                        min="8"
-                        max="28"
-                        step="2"
-                        aria-label="Lane width"
-                        bind:value={laneWidth}
+                        type="search"
+                        placeholder="Commit id"
+                        title="Go to a commit by its id"
+                        aria-label="Go to commit id"
+                        aria-invalid={gotoMissing}
+                        bind:value={gotoText}
+                        oninput={() => (gotoMissing = false)}
                     />
-                </label>
-            {/if}
-            <select aria-label="Row size" bind:value={rowHeight}>
-                {#each zooms as z (z.h)}
-                    <option value={z.h}>{z.label}</option>
-                {/each}
-            </select>
-            <form
-                class="goto"
-                onsubmit={(e) => {
-                    e.preventDefault();
-                    void goto();
-                }}
-            >
+                </form>
+                {#if info?.headRow !== null && info?.headRow !== undefined}
+                    <button
+                        type="button"
+                        onclick={gotoHead}
+                        title="Select the checked-out commit"
+                    >
+                        HEAD
+                    </button>
+                {/if}
+            </div>
+            <div class="side">
+                <input
+                    title="Only show commits whose message contains this text"
+                    type="search"
+                    placeholder="Message"
+                    aria-label="Search messages"
+                    bind:value={qMessage}
+                />
+                <input
+                    title="Only show commits by this author (name or email)"
+                    type="search"
+                    placeholder="Author"
+                    aria-label="Search authors"
+                    bind:value={qAuthor}
+                />
                 <input
                     type="search"
-                    placeholder="Commit id"
-                    title="Go to a commit by its id"
-                    aria-label="Go to commit id"
-                    aria-invalid={gotoMissing}
-                    bind:value={gotoText}
-                    oninput={() => (gotoMissing = false)}
+                    placeholder="Path"
+                    title="Only commits that change this file or folder"
+                    aria-label="Only commits that change this path"
+                    bind:value={path}
                 />
-            </form>
-            {#if info?.headRow !== null && info?.headRow !== undefined}
                 <button
                     type="button"
-                    onclick={gotoHead}
-                    title="Select the checked-out commit"
+                    class:on={showFilters}
+                    aria-expanded={showFilters}
+                    disabled={extraFilters > 0}
+                    title={extraFilters > 0
+                        ? "Clear the date and branch filters to hide them"
+                        : "Filter by date or branch"}
+                    onclick={() => (filtersOpen = !filtersOpen)}
                 >
-                    HEAD
+                    Filters{extraFilters > 0 ? ` (${extraFilters})` : ""}
                 </button>
-            {/if}
+                {#if queryActive}
+                    <button
+                        title="Clear the search and show every commit again"
+                        type="button"
+                        onclick={clearSearch}
+                    >
+                        Clear
+                    </button>
+                {/if}
+                <span class="status" aria-live="polite">
+                    {#if searching}
+                        Searching…
+                    {:else if searchRows}
+                        {searchRows.length} match{searchRows.length === 1
+                            ? ""
+                            : "es"}
+                    {/if}
+                </span>
+                {#if showGraph && searchRows && searchRows.length > 0}
+                    <button
+                        title="Jump to the previous match"
+                        type="button"
+                        onclick={() => nextMatch(-1)}
+                        aria-label="Previous match"
+                    >
+                        ↑
+                    </button>
+                    <button
+                        title="Jump to the next match"
+                        type="button"
+                        onclick={() => nextMatch(1)}
+                        aria-label="Next match"
+                    >
+                        ↓
+                    </button>
+                {/if}
+            </div>
         </div>
         {#if showFilters}
             <div class="group filters">
                 <label>
                     From <input
+                        title="Only show commits made on or after this date"
                         type="date"
                         aria-label="From date"
                         bind:value={qSince}
@@ -535,12 +615,14 @@
                 </label>
                 <label>
                     to <input
+                        title="Only show commits made on or before this date"
                         type="date"
                         aria-label="To date"
                         bind:value={qUntil}
                     />
                 </label>
                 <select
+                    title="Only show commits on this branch"
                     aria-label="Only commits on this branch"
                     bind:value={qBranch}
                 >
@@ -560,12 +642,57 @@
         <div class="pad"><ErrorBox error={searchError} /></div>
     {/if}
 
-    <div class="columns" class:nograph={!showGraph} style:--gw="{gw}px">
-        {#if showGraph}<span>Graph</span>{/if}
+    <div
+        class="columns"
+        class:nograph={!showGraph}
+        style:--gw="{gw}px"
+        style={cols}
+        bind:clientWidth={listW}
+    >
+        {#if showGraph}
+            <span>
+                Graph
+                <ColumnHandle
+                    bind:value={graphW}
+                    edge="right"
+                    min={GRAPH_MIN}
+                    max={Math.max(GRAPH_MIN, Math.round(listW * 0.6))}
+                    label="Resize the Graph column"
+                    storageKey="history.graph"
+                />
+            </span>
+        {/if}
         <span>Description</span>
-        <span class="author">Author</span>
-        <span>Date</span>
-        <span>Commit</span>
+        <span class="author">
+            Author
+            <ColumnHandle
+                bind:value={authorW}
+                min={60}
+                max={maxCol}
+                label="Resize the Author column"
+                storageKey="history.author"
+            />
+        </span>
+        <span>
+            Date
+            <ColumnHandle
+                bind:value={dateW}
+                min={70}
+                max={maxCol}
+                label="Resize the Date column"
+                storageKey="history.date"
+            />
+        </span>
+        <span>
+            Commit
+            <ColumnHandle
+                bind:value={shaW}
+                min={44}
+                max={maxCol}
+                label="Resize the Commit column"
+                storageKey="history.sha"
+            />
+        </span>
     </div>
     <div class="viewport">
         <div
@@ -575,6 +702,7 @@
             bind:clientHeight={viewH}
             onscroll={() => (scrollTop = scroller?.scrollTop ?? 0)}
             onkeydown={onkey}
+            oncontextmenu={listMenu}
             tabindex="0"
             role="listbox"
             aria-label="Commits"
@@ -583,12 +711,14 @@
                 ? `${uid}-r${displayIndexOf(selectedRow)}`
                 : undefined}
             style:--gw="{gw}px"
+            style={cols}
             style:--rh="{rowHeight}px"
         >
             <div class="spacer" style:height="{count * rowHeight}px">
                 {#each visible as v (v.i)}
                     <!-- svelte-ignore a11y_click_events_have_key_events (the list handles keys) -->
                     <div
+                        title="Click to see this commit's details. Right-click for more actions"
                         id="{uid}-r{v.i}"
                         tabindex="-1"
                         class="row"
@@ -603,6 +733,7 @@
                             v.row.row === selectedRow}
                         style:top="{v.i * rowHeight}px"
                         onclick={() => v.row && selectRow(v.row)}
+                        oncontextmenu={(e) => v.row && rowMenu(e, v.row)}
                     >
                         {#if showGraph}<span></span>{/if}
                         {#if v.row}
@@ -613,6 +744,15 @@
                                         class:head={r.isHead}
                                     >
                                         {r.name}
+                                    </span>
+                                {/each}
+                                {#each v.row.branched as b (b.name)}
+                                    <span
+                                        class="fork"
+                                        style:color={`var(${graphColorVar(b.color)})`}
+                                        title={`${b.name} was made from this commit and nothing else has been committed here since, so both share one line. Its commits above are drawn in this colour.`}
+                                    >
+                                        ⑂ {b.name} branched here
                                     </span>
                                 {/each}
                                 {v.row.subject}
@@ -629,17 +769,56 @@
                         {/if}
                     </div>
                 {/each}
+                {#if shapes}
+                    <svg
+                        class="graph"
+                        style:top="{graphFirst * rowHeight}px"
+                        width={gw}
+                        height={shapes.height}
+                        aria-hidden="true"
+                    >
+                        <g
+                            fill="none"
+                            stroke-width={shapes.lineWidth}
+                            stroke-linecap="round"
+                        >
+                            {#each shapes.edges as e, k (k)}
+                                <path
+                                    d={e.d}
+                                    style:stroke={e.color}
+                                    opacity={e.faded ? 0.3 : 1}
+                                />
+                            {/each}
+                            {#each shapes.nodes as n, k (k)}
+                                <g opacity={n.faded ? 0.3 : 1}>
+                                    <circle
+                                        cx={n.cx}
+                                        cy={n.cy}
+                                        r={n.r}
+                                        style:stroke={n.hollow
+                                            ? n.color
+                                            : "none"}
+                                        style:fill={n.hollow
+                                            ? "var(--bg)"
+                                            : n.color}
+                                    />
+                                    {#if n.ring}
+                                        <circle
+                                            cx={n.cx}
+                                            cy={n.cy}
+                                            r={n.r + shapes.ringGap}
+                                            style:stroke={n.ring === "selected"
+                                                ? "var(--text)"
+                                                : n.color}
+                                        />
+                                    {/if}
+                                </g>
+                            {/each}
+                        </g>
+                    </svg>
+                {/if}
             </div>
         </div>
-        {#if showGraph}
-            <canvas
-                class="graph"
-                bind:this={canvas}
-                style:width="{gw}px"
-                style:height="{viewH}px"
-                aria-hidden="true"
-            ></canvas>
-        {/if}
         {#if info && info.rows === 0}
             <p class="empty">No commits yet.</p>
         {:else if info && count === 0 && searchRows}
@@ -656,21 +835,41 @@
         min-height: 0;
         height: 100%;
     }
-    /* One flowing row of controls, so they wrap as late as possible. */
+    /* One row: view controls, then the search fields and Filters. It holds everything on one line and the
+       text fields give up width first, so the window's minimum width is what keeps it from wrapping. */
     .toolbar {
         display: flex;
-        flex-wrap: wrap;
+        flex-direction: column;
         gap: 0.4rem;
-        align-items: center;
         padding: 0.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
         background: var(--surface);
     }
     .group {
-        display: contents;
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 0.3rem;
+        align-items: center;
+        min-width: 0;
+    }
+    /* The view controls lean left and the search controls lean right, with the free space between. */
+    .group:not(.filters) {
+        justify-content: space-between;
+    }
+    .side {
+        min-width: 0;
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 0.3rem;
+        align-items: center;
     }
     .toolbar select {
-        max-width: 9.5rem;
+        min-width: 5.5rem;
+        max-width: 7.5rem;
+    }
+    /* "All branches" has to show in full. */
+    .toolbar label:first-child select {
+        max-width: 8.75rem;
     }
     /* Text fields give up width before anything wraps to another line. */
     .toolbar input[type="search"] {
@@ -678,21 +877,18 @@
         min-width: 6rem;
         max-width: 9rem;
     }
-    .toolbar .goto input {
-        min-width: 7.5rem;
+    /* "Commit id" has to fit in full. */
+    .toolbar .goto input[type="search"] {
+        min-width: 7rem;
     }
     .lanes {
-        width: 5rem;
+        width: 3.5rem;
         padding: 0;
         border: none;
         background: none;
     }
     .group.filters {
-        display: flex;
-        flex-basis: 100%;
         flex-wrap: wrap;
-        gap: 0.4rem;
-        align-items: center;
     }
     .toolbar button.on {
         border-color: var(--accent);
@@ -708,7 +904,23 @@
         color: var(--text-muted);
     }
     .toolbar button {
-        padding: 0.4rem 0.6rem;
+        padding: 0.4rem 0.45rem;
+    }
+    /* Labels and their selects give up width down to the selects' minimum; buttons never do. */
+    .toolbar label {
+        flex-shrink: 1;
+        min-width: 0;
+    }
+    /* The slider has a fixed width, so its label does not shrink around it. */
+    .toolbar label.lane {
+        flex-shrink: 0;
+    }
+    .toolbar label,
+    .status {
+        white-space: nowrap;
+    }
+    .status {
+        flex-shrink: 0;
     }
     .status {
         color: var(--text-muted);
@@ -722,25 +934,34 @@
     .columns,
     .row {
         display: grid;
-        grid-template-columns: var(--gw) minmax(0, 1fr) 10rem 11rem 5.5rem;
+        grid-template-columns:
+            var(--gw) minmax(0, 1fr) var(--c-author, 10rem)
+            var(--c-date, 11rem) var(--c-sha, 5.5rem);
         gap: 0 0.6rem;
         align-items: center;
     }
     /* Log view: no graph cell, so no graph column and a normal left gutter. */
     .columns.nograph,
     .nograph .row {
-        grid-template-columns: minmax(0, 1fr) 10rem 11rem 5.5rem;
+        grid-template-columns:
+            minmax(0, 1fr) var(--c-author, 10rem) var(--c-date, 11rem)
+            var(--c-sha, 5.5rem);
         padding-left: 0.6rem;
     }
     /* Narrow: drop the author column (its name stays in the commit panel). */
     @container (max-width: 50rem) {
         .columns,
         .row {
-            grid-template-columns: var(--gw) minmax(0, 1fr) 11rem 5.5rem;
+            grid-template-columns:
+                var(--gw) minmax(0, 1fr) var(--c-date, 11rem)
+                var(--c-sha, 5.5rem);
         }
         .columns.nograph,
         .nograph .row {
-            grid-template-columns: minmax(0, 1fr) 11rem 5.5rem;
+            grid-template-columns: minmax(0, 1fr) var(--c-date, 11rem) var(
+                    --c-sha,
+                    5.5rem
+                );
         }
         .author {
             display: none;
@@ -751,6 +972,9 @@
         border-bottom: 1px solid var(--border);
         color: var(--text-muted);
         font-size: 12px;
+    }
+    .columns > span {
+        position: relative;
     }
     .columns > :first-child {
         padding-left: 0.6rem;
@@ -824,6 +1048,23 @@
         line-height: 1.45;
         vertical-align: 1px;
     }
+    /* A long branch name is cut inside its pill, so the pills never push the subject out. */
+    .ref {
+        max-width: 11rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: bottom;
+    }
+    .fork {
+        display: inline-block;
+        margin-right: 0.35rem;
+        padding: 0 0.4rem;
+        border: 1px dashed currentColor;
+        border-radius: 9px;
+        font-size: 11.5px;
+        line-height: 1.45;
+        vertical-align: 1px;
+    }
     .ref.remote {
         border-color: var(--text-muted);
         color: var(--text-muted);
@@ -837,10 +1078,11 @@
         color: var(--accent-text);
         font-weight: 600;
     }
+    /* Inside the spacer, so it scrolls with the rows; above their backgrounds. */
     .graph {
         position: absolute;
-        top: 0;
         left: 0;
+        overflow: hidden;
         pointer-events: none;
     }
     .empty {

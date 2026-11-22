@@ -4,3 +4,4 @@ src/desktop/gen
 src/desktop/icons
 package-lock.json
 src/ui/lib/bindings
+src/desktop/target

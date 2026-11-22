@@ -67,8 +67,14 @@ pub enum ProjectView {
     Overview,
     Graph,
     Log,
+    /// Uncommitted work: stage, unstage, discard and commit.
+    Changes,
+    /// Browse the project's folder and edit text files.
+    Files,
     Staging,
     Releases,
+    /// The operation log (and later the backups to undo with).
+    Activity,
     Settings,
 }
 

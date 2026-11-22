@@ -122,6 +122,9 @@ pub struct DiffLine {
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct Hunk {
+    /// Names this hunk to a stage or unstage action, which refuses it if the file has changed
+    /// since (the hunk's position or any of its lines). A check value, not a secret.
+    pub id: String,
     pub old_start: u32,
     pub old_lines: u32,
     pub new_start: u32,
@@ -534,6 +537,28 @@ pub fn file_diff(
     Ok(out)
 }
 
+/// Takes spaces and tabs off the ends of each emphasised range and drops ranges that hold only
+/// whitespace. A re-indented line would otherwise show a pale block over its indentation, which
+/// reads as a change to the code and is not one.
+fn trim_emphasis(text: &str, emphasis: &mut Vec<[u32; 2]>) {
+    if emphasis.is_empty() {
+        return;
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let blank = |u: u16| u == 0x20 || u == 0x09 || u == 0xA0;
+    emphasis.retain_mut(|r| {
+        let (mut start, mut end) = (r[0] as usize, (r[1] as usize).min(units.len()));
+        while start < end && blank(units[start]) {
+            start += 1;
+        }
+        while end > start && blank(units[end - 1]) {
+            end -= 1;
+        }
+        *r = [start as u32, end as u32];
+        start < end
+    });
+}
+
 /// Unified-diff hunks with `context` lines around each change and word emphasis inside
 /// replaced lines.
 pub fn hunks(old: &str, new: &str, context: usize) -> Vec<Hunk> {
@@ -577,6 +602,7 @@ pub fn hunks(old: &str, new: &str, context: usize) -> Vec<Hunk> {
                     r[1] = r[1].min(end);
                     r[0] < r[1]
                 });
+                trim_emphasis(&text, &mut emphasis);
                 // Emphasis on a whole line says nothing; show it as a plain change.
                 if emphasis.len() == 1 && emphasis[0] == [0, end] {
                     emphasis.clear();
@@ -593,16 +619,44 @@ pub fn hunks(old: &str, new: &str, context: usize) -> Vec<Hunk> {
         }
         let old_lines = old_range.len() as u32;
         let new_lines = new_range.len() as u32;
+        // Like git: an empty side starts at the line before (0 for an empty file).
+        let old_start = old_range.start as u32 + u32::from(old_lines > 0);
+        let new_start = new_range.start as u32 + u32::from(new_lines > 0);
         out.push(Hunk {
-            // Like git: an empty side starts at the line before (0 for an empty file).
-            old_start: old_range.start as u32 + u32::from(old_lines > 0),
+            id: hunk_id([old_start, old_lines, new_start, new_lines], &lines),
+            old_start,
             old_lines,
-            new_start: new_range.start as u32 + u32::from(new_lines > 0),
+            new_start,
             new_lines,
             lines,
         });
     }
     out
+}
+
+/// FNV-1a over a hunk's header and lines: stable across runs and builds, unlike `DefaultHasher`.
+fn hunk_id(header: [u32; 4], lines: &[DiffLine]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for n in header {
+        eat(&n.to_le_bytes());
+    }
+    for l in lines {
+        let kind = match l.kind {
+            LineKind::Context => b' ',
+            LineKind::Added => b'+',
+            LineKind::Deleted => b'-',
+        };
+        eat(&[kind, u8::from(l.no_newline)]);
+        eat(&(l.text.len() as u64).to_le_bytes());
+        eat(l.text.as_bytes());
+    }
+    format!("{h:016x}")
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -708,4 +762,291 @@ pub fn blame(repo: &gix::Repository, id: ObjectId, path: &str) -> Result<Blame, 
         });
     }
     Ok(out)
+}
+
+/// Which uncommitted change of a file to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkSide {
+    /// HEAD to the index: what the next commit takes.
+    Staged,
+    /// The index to the working tree (untracked files compare with nothing). A conflicted file
+    /// compares "our" side with the file as it is now, conflict markers included.
+    Unstaged,
+}
+
+/// A side of a working-tree diff: mode, content and size (`None` when the file is not there).
+/// Content over [`MAX_FILE`] is not read, so it is empty while the size is real.
+type WorkEntry = Option<(gix::object::tree::EntryMode, Vec<u8>, u64)>;
+
+fn index_entry(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &str,
+) -> Result<WorkEntry, AppError> {
+    use gix::index::entry::Stage;
+    let p = path.as_bytes().as_bstr();
+    let Some(e) = index
+        .entry_by_path_and_stage(p, Stage::Unconflicted)
+        .or_else(|| index.entry_by_path_and_stage(p, Stage::Ours))
+    else {
+        return Ok(None);
+    };
+    let Some(mode) = e.mode.to_tree_entry_mode() else {
+        return Ok(None);
+    };
+    let size = blob_size(repo, mode.kind(), e.id)?;
+    if size > MAX_FILE {
+        return Ok(Some((mode, Vec::new(), size)));
+    }
+    Ok(Some((mode, entry_content(repo, mode.kind(), e.id)?, size)))
+}
+
+fn head_entry(repo: &gix::Repository, parts: &[String]) -> Result<WorkEntry, AppError> {
+    let tree = match repo.head_tree() {
+        Ok(t) => t,
+        // An unborn branch has no commit yet, so nothing is in HEAD.
+        Err(_) if repo.head_id().is_err() => return Ok(None),
+        Err(e) => return Err(git_err("the current commit", e)),
+    };
+    let Some(e) = tree
+        .lookup_entry(parts.iter().map(|c| c.as_bytes()))
+        .map_err(|e| git_err("the current commit's files", e))?
+        .filter(|e| !e.mode().is_tree())
+    else {
+        return Ok(None);
+    };
+    let (mode, id) = (e.mode(), e.object_id());
+    let size = blob_size(repo, mode.kind(), id)?;
+    if size > MAX_FILE {
+        return Ok(Some((mode, Vec::new(), size)));
+    }
+    Ok(Some((mode, entry_content(repo, mode.kind(), id)?, size)))
+}
+
+/// The file as it is on disk. Refuses a path that goes through a symbolic link, so nothing
+/// outside the working tree is read; a symbolic link itself shows its target, as git does.
+fn worktree_entry(
+    root: &std::path::Path,
+    parts: &[String],
+    index_mode: Option<gix::object::tree::EntryMode>,
+) -> Result<WorkEntry, AppError> {
+    use gix::object::tree::EntryKind as K;
+    let io =
+        |e: std::io::Error| AppError::new(ErrorKind::Io, format!("could not read the file: {e}"));
+    let mut full = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        full.push(part);
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io(e)),
+        };
+        let last = i + 1 == parts.len();
+        if meta.file_type().is_symlink() {
+            if !last {
+                return Err(AppError::invalid(format!(
+                    "{} goes through a symbolic link",
+                    parts.join("/")
+                )));
+            }
+            let target = std::fs::read_link(&full).map_err(io)?;
+            let text = target.to_string_lossy().replace('\\', "/").into_bytes();
+            let size = text.len() as u64;
+            return Ok(Some((K::Link.into(), text, size)));
+        }
+        if !last {
+            if !meta.is_dir() {
+                return Ok(None);
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            // A nested repository or submodule; there is no file content to show.
+            return Ok(None);
+        }
+        let size = meta.len();
+        #[cfg(unix)]
+        let exec = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        };
+        // Windows has no executable bit; git keeps the index's (core.fileMode is false there).
+        #[cfg(not(unix))]
+        let exec = index_mode.is_some_and(|m| m.kind() == K::BlobExecutable);
+        #[cfg(unix)]
+        let _ = index_mode;
+        let kind = if exec { K::BlobExecutable } else { K::Blob };
+        if size > MAX_FILE {
+            return Ok(Some((kind.into(), Vec::new(), size)));
+        }
+        let data = std::fs::read(&full).map_err(io)?;
+        return Ok(Some((kind.into(), data, size)));
+    }
+    Ok(None)
+}
+
+/// One file's uncommitted change: staged (HEAD to index) or unstaged (index to working tree).
+/// Working-tree text with CRLF line endings is compared as LF when the other side has none, so
+/// a file checked out with `core.autocrlf` does not show every line as changed.
+pub fn work_diff(
+    repo: &gix::Repository,
+    path: &str,
+    side: WorkSide,
+    context: u32,
+    force: bool,
+) -> Result<FileDiff, AppError> {
+    work_compare(repo, path, side, context, force).map(|c| c.diff)
+}
+
+/// Most files [`work_stats`] counts in one call; the rest show no count.
+pub const WORK_STATS_MAX: usize = 300;
+
+/// Lines added and removed in one uncommitted file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkStat {
+    pub path: String,
+    pub side: WorkSide,
+    /// `None` for a binary or very large file, or one that could not be read.
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+/// Line counts for the files of the Changes list, each compared as [`work_diff`] would.
+pub fn work_stats(repo: &gix::Repository, files: &[(String, WorkSide)]) -> Vec<WorkStat> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, (path, side))| {
+            let counts = (i < WORK_STATS_MAX)
+                .then(|| work_compare(repo, path, *side, 0, false).ok())
+                .flatten()
+                .filter(|c| !c.diff.binary && !c.diff.too_large)
+                .map(|c| {
+                    let mut add = 0;
+                    let mut del = 0;
+                    for l in c.diff.hunks.iter().flat_map(|h| &h.lines) {
+                        match l.kind {
+                            LineKind::Added => add += 1,
+                            LineKind::Deleted => del += 1,
+                            LineKind::Context => {}
+                        }
+                    }
+                    (add, del)
+                });
+            WorkStat {
+                path: path.clone(),
+                side: *side,
+                additions: counts.map(|c| c.0),
+                deletions: counts.map(|c| c.1),
+            }
+        })
+        .collect()
+}
+
+/// A [`work_diff`] with the bytes it compared, so part of it can be staged or unstaged.
+pub(crate) struct WorkCompare {
+    pub diff: FileDiff,
+    /// Empty when the diff has no hunks because the file is binary or too large.
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+    /// The working tree's CRLF line endings were compared (and are in `new`) as LF.
+    pub crlf_as_lf: bool,
+}
+
+pub(crate) fn work_compare(
+    repo: &gix::Repository,
+    path: &str,
+    side: WorkSide,
+    context: u32,
+    force: bool,
+) -> Result<WorkCompare, AppError> {
+    crate::actions::check_path(path)?;
+    let parts = clean_path(path)?;
+    let clean = parts.join("/");
+    let root = repo
+        .workdir()
+        .ok_or_else(|| AppError::invalid("a bare repository has no working tree"))?
+        .to_path_buf();
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| git_err("the staging area", e))?;
+    let (old, new) = match side {
+        WorkSide::Staged => (
+            head_entry(repo, &parts)?,
+            index_entry(repo, &index, &clean)?,
+        ),
+        WorkSide::Unstaged => {
+            let old = index_entry(repo, &index, &clean)?;
+            let new = worktree_entry(&root, &parts, old.as_ref().map(|(m, _, _)| *m))?;
+            (old, new)
+        }
+    };
+    let status = match (&old, &new) {
+        (None, None) => {
+            return Err(AppError::not_found(format!(
+                "{clean} has no {} changes",
+                match side {
+                    WorkSide::Staged => "staged",
+                    WorkSide::Unstaged => "unstaged",
+                }
+            )));
+        }
+        (None, Some(_)) => FileStatus::Added,
+        (Some(_), None) => FileStatus::Deleted,
+        (Some((om, _, _)), Some((nm, _, _))) if !same_type(om.kind(), nm.kind()) => {
+            FileStatus::TypeChanged
+        }
+        _ => FileStatus::Modified,
+    };
+    let mut out = FileDiff {
+        path: clean,
+        old_path: None,
+        status,
+        binary: false,
+        too_large: false,
+        old_size: old.as_ref().map(|(_, _, s)| *s),
+        new_size: new.as_ref().map(|(_, _, s)| *s),
+        old_mode: old.as_ref().map(|(m, _, _)| mode_str(*m)),
+        new_mode: new.as_ref().map(|(m, _, _)| mode_str(*m)),
+        hunks: Vec::new(),
+    };
+    let nothing = |diff| WorkCompare {
+        diff,
+        old: Vec::new(),
+        new: Vec::new(),
+        crlf_as_lf: false,
+    };
+    let biggest = out.old_size.unwrap_or(0).max(out.new_size.unwrap_or(0));
+    if biggest > MAX_FILE || (biggest > LARGE_FILE && !force) {
+        out.too_large = true;
+        return Ok(nothing(out));
+    }
+    let (a, mut b) = (
+        old.map(|(_, d, _)| d).unwrap_or_default(),
+        new.map(|(_, d, _)| d).unwrap_or_default(),
+    );
+    if is_binary(&a) || is_binary(&b) {
+        out.binary = true;
+        return Ok(nothing(out));
+    }
+    let crlf_as_lf =
+        side == WorkSide::Unstaged && !a.contains(&b'\r') && b.windows(2).any(|w| w == b"\r\n");
+    if crlf_as_lf {
+        b = b.replace(b"\r\n", b"\n");
+    }
+    out.hunks = hunks(
+        &String::from_utf8_lossy(&a),
+        &String::from_utf8_lossy(&b),
+        context.min(1000) as usize,
+    );
+    Ok(WorkCompare {
+        diff: out,
+        old: a,
+        new: b,
+        crlf_as_lf,
+    })
 }

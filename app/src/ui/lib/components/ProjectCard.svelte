@@ -1,5 +1,8 @@
 <script lang="ts">
     import type { ProjectSummary } from "../bindings/ProjectSummary";
+    import { api } from "../api";
+    import type { AppError } from "../bindings/AppError";
+    import { offerMenu } from "../contextMenu";
     import { operationLabel, pathTail } from "../format";
 
     let {
@@ -14,10 +17,43 @@
         p.staged + p.unstaged + p.untracked + p.conflicted,
     );
     const broken = $derived(p.repoError ?? p.projError);
+    let folderError = $state<AppError | null>(null);
+
+    function menu(e: MouseEvent) {
+        offerMenu(e, {
+            items: [
+                {
+                    id: "folder",
+                    label: "Open folder",
+                    keys: "",
+                    disabled: false,
+                    hint: "Show the project's folder in your file manager",
+                },
+                {
+                    id: "path",
+                    label: "Copy path",
+                    keys: "",
+                    disabled: false,
+                    hint: "Copy the project's folder path to the clipboard",
+                },
+            ],
+            run: (id) => {
+                if (id === "path") void navigator.clipboard.writeText(p.path);
+                else
+                    api.openFolder(p.id).then(
+                        () => (folderError = null),
+                        (err) => (folderError = err as AppError),
+                    );
+            },
+        });
+    }
 </script>
 
-<article class="card" class:broken>
+<article class="card" class:broken oncontextmenu={menu}>
     <button
+        title={p.repoError
+            ? "This repository has a problem, so it cannot be opened"
+            : "Open this project"}
         type="button"
         class="open"
         onclick={onopen}
@@ -93,6 +129,9 @@
     >
         ✕
     </button>
+    {#if folderError}
+        <p class="problem" role="alert">{folderError.message}</p>
+    {/if}
 </article>
 
 <style>
@@ -112,7 +151,9 @@
     }
     .open {
         display: grid;
+        grid-template-columns: minmax(0, 1fr);
         gap: 0.35rem;
+        white-space: normal;
         width: 100%;
         padding: 0.9rem 1rem;
         border: none;
@@ -131,7 +172,11 @@
         align-items: baseline;
         padding-right: 1.5rem;
     }
+    .version {
+        flex-shrink: 0;
+    }
     .name {
+        min-width: 0;
         overflow: hidden;
         font-weight: 600;
         font-size: 1.05rem;
@@ -150,6 +195,7 @@
     }
     .branch {
         font-family: ui-monospace, monospace;
+        overflow-wrap: anywhere;
     }
     .path {
         overflow: hidden;

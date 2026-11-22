@@ -1,6 +1,7 @@
 <script lang="ts">
     // One project tab. It stays mounted while other tabs show, so its own state (scroll, loaded
     // data, later the graph) survives switching tabs; it never reads another tab's state.
+    import { limits, lockSelection } from "../paneSize";
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { RefLabel } from "../bindings/RefLabel";
@@ -9,8 +10,11 @@
     import type { RepoState } from "../bindings/RepoState";
     import { operationLabel } from "../format";
     import { VIEWS } from "../tabs";
+    import ActivityView from "./ActivityView.svelte";
+    import ChangesView from "./ChangesView.svelte";
     import CommitPanel from "./CommitPanel.svelte";
     import ErrorBox from "./ErrorBox.svelte";
+    import FilesView from "./FilesView.svelte";
     import HistoryView from "./HistoryView.svelte";
 
     let {
@@ -33,6 +37,10 @@
     let repo = $state<RepoState | null>(null);
     let error = $state<AppError | null>(null);
     let loadedAt = -1;
+
+    async function reload() {
+        await load(changed);
+    }
 
     async function load(tick: number) {
         loadedAt = tick;
@@ -59,34 +67,47 @@
     let selected = $state<string | null>(null);
     let selectedRefs = $state<RefLabel[]>([]);
     let historyPath = $state("");
+    /** The file the Files tab should open, set by "Open in Files" elsewhere. */
+    let filePath = $state("");
     let diffMode = $state<"unified" | "split">("unified");
+    // The commit draft outlives switching views.
+    let draft = $state("");
+    let amend = $state(false);
     /** Share of the height given to the commit list when a commit is open. */
     let split = $state(0.45);
     let splitBox = $state<HTMLElement>();
+    // The list and the details each keep room for their own controls, however the line is dragged.
+    const LIST_MIN = 224;
+    const PANEL_MIN = 256;
+    const range = (h: number) => limits(h, 0.15, 0.85, LIST_MIN, PANEL_MIN);
 
     function dragSplit(e: PointerEvent) {
         const box = splitBox;
         if (!box) return;
         const handle = e.currentTarget as HTMLElement;
         handle.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        const unlock = lockSelection();
         const move = (ev: PointerEvent) => {
             const r = box.getBoundingClientRect();
-            split = Math.min(
-                0.85,
-                Math.max(0.15, (ev.clientY - r.top) / r.height),
-            );
+            const [lo, hi] = range(r.height);
+            split = Math.min(hi, Math.max(lo, (ev.clientY - r.top) / r.height));
         };
         const up = () => {
+            unlock();
             handle.removeEventListener("pointermove", move);
             handle.removeEventListener("pointerup", up);
+            handle.removeEventListener("pointercancel", up);
         };
         handle.addEventListener("pointermove", move);
         handle.addEventListener("pointerup", up);
+        handle.addEventListener("pointercancel", up);
     }
 
     function splitKey(e: KeyboardEvent) {
-        if (e.key === "ArrowUp") split = Math.max(0.15, split - 0.05);
-        else if (e.key === "ArrowDown") split = Math.min(0.85, split + 0.05);
+        const [lo, hi] = range(splitBox?.clientHeight ?? 0);
+        if (e.key === "ArrowUp") split = Math.max(lo, split - 0.05);
+        else if (e.key === "ArrowDown") split = Math.min(hi, split + 0.05);
         else return;
         e.preventDefault();
     }
@@ -100,11 +121,24 @@
     };
 </script>
 
+<!-- Esc closes the commit details wherever focus is, unless something else used the key: a text
+     field, a dialog, the context menu or an open name form. -->
+<svelte:window
+    onkeydown={(e) => {
+        if (e.key !== "Escape" || e.defaultPrevented) return;
+        if (!active || !isHistory || !selected) return;
+        const t = e.target as HTMLElement | null;
+        if (t?.closest("input, textarea, select, dialog")) return;
+        selected = null;
+    }}
+/>
+
 <div class="project">
     <nav class="side" aria-label="Project views">
         <div class="title" title={summary?.path}>{summary?.name ?? id}</div>
         {#each VIEWS as v (v.id)}
             <button
+                title={v.hint}
                 type="button"
                 class:current={view === v.id}
                 aria-current={view === v.id ? "page" : undefined}
@@ -121,7 +155,7 @@
             hidden={!isHistory}
             bind:this={splitBox}
             style:grid-template-rows={selected
-                ? `minmax(0, ${split}fr) 6px minmax(0, ${1 - split}fr)`
+                ? `minmax(${LIST_MIN}px, ${split * 100}%) 6px minmax(${PANEL_MIN}px, 1fr)`
                 : "minmax(0, 1fr)"}
         >
             <HistoryView
@@ -129,6 +163,7 @@
                 active={active && isHistory}
                 {changed}
                 showGraph={view === "graph"}
+                head={repo?.head ?? null}
                 bind:selected
                 bind:selectedRefs
                 bind:path={historyPath}
@@ -138,6 +173,7 @@
                 <div
                     class="splitter"
                     role="separator"
+                    title="Drag to resize, or use the up and down arrow keys"
                     aria-orientation="horizontal"
                     aria-label="Resize the commit details"
                     aria-valuenow={Math.round(split * 100)}
@@ -151,8 +187,10 @@
                     projectId={id}
                     commit={selected}
                     refs={selectedRefs}
+                    head={repo?.head ?? null}
                     bind:diffMode
                     onjump={(c) => (selected = c)}
+                    onclose={() => (selected = null)}
                     onhistory={(p) => {
                         historyPath = p;
                         onview("log");
@@ -161,8 +199,46 @@
             {/if}
         </section>
     {/if}
-    <section class="main" hidden={isHistory}>
-        {#if view === "overview"}
+    {#if view === "changes"}
+        <section class="main flush changes">
+            {#if error}
+                <div class="pad"><ErrorBox {error} /></div>
+            {:else if repo}
+                <ChangesView
+                    projectId={id}
+                    {repo}
+                    {changed}
+                    bind:message={draft}
+                    bind:amend
+                    bind:diffMode
+                    onreload={reload}
+                    onopenfile={(p) => {
+                        filePath = p;
+                        onview("files");
+                    }}
+                />
+            {:else}
+                <p class="muted pad">Loading…</p>
+            {/if}
+        </section>
+    {/if}
+    {#if view === "files"}
+        <section class="main flush changes">
+            <FilesView projectId={id} {changed} bind:path={filePath} />
+        </section>
+    {/if}
+    <section
+        class="main"
+        hidden={isHistory || view === "changes" || view === "files"}
+    >
+        {#if view === "activity"}
+            <ActivityView
+                projectId={id}
+                root={summary?.path}
+                {active}
+                onreload={reload}
+            />
+        {:else if view === "overview"}
             <h2>Overview</h2>
             {#if error}
                 <ErrorBox {error} />
@@ -186,7 +262,20 @@
                 {/if}
                 <dl>
                     <dt>Folder</dt>
-                    <dd><code>{repo.root}</code></dd>
+                    <dd>
+                        <code>{repo.root}</code>
+                        <button
+                            type="button"
+                            class="folder"
+                            title="Show this project's folder in your file manager"
+                            onclick={() =>
+                                api
+                                    .openFolder(id)
+                                    .catch((e) => (error = e as AppError))}
+                        >
+                            Open folder
+                        </button>
+                    </dd>
                     <dt>Branch</dt>
                     <dd>
                         {#if repo.head.detached}
@@ -298,6 +387,12 @@
         padding: 0;
         overflow: hidden;
     }
+    .main.changes {
+        container-type: inline-size;
+    }
+    .pad {
+        padding: 1rem;
+    }
     /* After .flush, which would otherwise win and keep the hidden history view on screen. */
     .main[hidden] {
         display: none;
@@ -327,6 +422,11 @@
     dd {
         margin: 0;
         word-break: break-word;
+    }
+    .folder {
+        margin-left: 0.5rem;
+        padding: 0.1rem 0.55rem;
+        font-size: 0.85rem;
     }
     .muted {
         color: var(--text-muted);

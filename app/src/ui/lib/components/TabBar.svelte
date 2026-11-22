@@ -83,6 +83,7 @@
 
 <div bind:this={bar} class="bar" role="tablist" aria-label="Open projects">
     <button
+        title="Go to the list of your projects"
         type="button"
         role="tab"
         class="tab hub"
@@ -191,7 +192,10 @@
         white-space: nowrap;
         cursor: pointer;
     }
+    /* The only control that gives up width: a long project name is cut with an ellipsis. */
     .label {
+        flex-shrink: 1;
+        min-width: 0;
         padding-right: 0.25rem;
     }
     [aria-selected="true"] {

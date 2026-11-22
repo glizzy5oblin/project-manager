@@ -3,16 +3,25 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { Account } from "./bindings/Account";
+import type { Action } from "./bindings/Action";
 import type { AppError } from "./bindings/AppError";
 import type { AuthStatus } from "./bindings/AuthStatus";
 import type { Blame } from "./bindings/Blame";
 import type { CommitDetail } from "./bindings/CommitDetail";
+import type { BackupRecord } from "./bindings/BackupRecord";
+import type { FileList } from "./bindings/FileList";
+import type { FileText } from "./bindings/FileText";
+import type { ConflictInfo } from "./bindings/ConflictInfo";
 import type { FileDiff } from "./bindings/FileDiff";
+import type { RestorePreview } from "./bindings/RestorePreview";
+import type { WorkStat } from "./bindings/WorkStat";
 import type { GitInstall } from "./bindings/GitInstall";
 import type { GraphInfo } from "./bindings/GraphInfo";
 import type { GraphOptions } from "./bindings/GraphOptions";
 import type { GraphRow } from "./bindings/GraphRow";
 import type { LogQuery } from "./bindings/LogQuery";
+import type { OpEntry } from "./bindings/OpEntry";
+import type { Preview } from "./bindings/Preview";
 import type { ProjectEntry } from "./bindings/ProjectEntry";
 import type { ProjectSummary } from "./bindings/ProjectSummary";
 import type { RepoState } from "./bindings/RepoState";
@@ -20,9 +29,11 @@ import type { SearchResult } from "./bindings/SearchResult";
 import type { Session } from "./bindings/Session";
 import type { Settings } from "./bindings/Settings";
 import type { SignIn } from "./bindings/SignIn";
+import type { StashEntry } from "./bindings/StashEntry";
 import type { TaskInfo } from "./bindings/TaskInfo";
 import type { ThemeList } from "./bindings/ThemeList";
 import type { WorkflowMode } from "./bindings/WorkflowMode";
+import type { WorkSide } from "./bindings/WorkSide";
 
 export function isAppError(e: unknown): e is AppError {
     return (
@@ -124,4 +135,50 @@ export const api = {
         }),
     fileBlame: (id: string, commit: string, path: string) =>
         call<Blame>("file_blame", { id, commit, path }),
+    /** One file's uncommitted change: staged (HEAD to index) or unstaged (index to disk). */
+    workDiff: (id: string, path: string, side: WorkSide, force: boolean) =>
+        call<FileDiff>("work_diff", { id, path, side, context: null, force }),
+    /** Lines added and removed in each uncommitted file of the Changes list. */
+    workStats: (id: string, files: [string, WorkSide][]) =>
+        call<WorkStat[]>("work_stats", { id, files }),
+    /** What `action` would do; dangerous actions need the returned `token` to run. */
+    actionPreview: (id: string, action: Action, allowUntrusted = false) =>
+        call<Preview>("action_preview", { id, action, allowUntrusted }),
+    /** Starts the action as a task; its ActionOutcome arrives in the task's finished event. */
+    actionRun: (
+        id: string,
+        action: Action,
+        token: string | null,
+        allowUntrusted = false,
+    ) => call<number>("action_run", { id, action, token, allowUntrusted }),
+    /** The stash list, newest first (at most 200). */
+    stashList: (id: string) => call<StashEntry[]>("stash_list", { id }),
+    /** Show the project's folder (or one file in it, relative path) in the file manager. */
+    openFolder: (id: string, path: string | null = null) =>
+        call<void>("open_folder", { id, path }),
+    /** One folder of the project ("" is the top), folders first. */
+    filesList: (id: string, dir: string) =>
+        call<FileList>("files_list", { id, dir }),
+    /** A text file of the project, or why it cannot be edited. */
+    fileRead: (id: string, path: string) =>
+        call<FileText>("file_read", { id, path }),
+    /** Save a text file of the project. */
+    fileWrite: (id: string, path: string, content: string) =>
+        call<void>("file_write", { id, path, content }),
+    /** Make a new empty file (or folder) in the project. Never replaces one. */
+    fileCreate: (id: string, path: string, dir: boolean) =>
+        call<void>("file_create", { id, path, dir }),
+    /** What kind of conflict a file is in and where the two sides disagree. */
+    conflictInfo: (id: string, path: string) =>
+        call<ConflictInfo>("conflict_info", { id, path }),
+    /** Restore points (backups) of a project, newest first. */
+    backupsList: (id: string) => call<BackupRecord[]>("backups_list", { id }),
+    /** What restoring a restore point would change. */
+    backupPreview: (id: string, backup: string) =>
+        call<RestorePreview>("backup_preview", { id, backup }),
+    /** Starts a restore as a task; its ActionOutcome arrives in the task's finished event. */
+    backupRestore: (id: string, backup: string) =>
+        call<number>("backup_restore", { id, backup }),
+    opLog: () => call<OpEntry[]>("op_log"),
+    opLogClear: () => call<void>("op_log_clear"),
 };

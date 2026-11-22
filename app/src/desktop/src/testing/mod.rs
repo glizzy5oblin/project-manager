@@ -9,6 +9,7 @@
 #![allow(dead_code)] // Shapes are used by later tests as features land.
 
 use std::cell::Cell;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -78,7 +79,7 @@ impl FixtureRepo {
     pub fn command(&self, cwd: &Path, args: &[&str]) -> GitCommand {
         let t = self.clock.get();
         let date = format!("@{t} +0000");
-        GitCommand::new(cwd)
+        let cmd = GitCommand::new(cwd)
             .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(["-c", "core.autocrlf=false"])
             // Outside the working tree, so tools that install hooks (git-lfs) leave no files in it.
@@ -89,16 +90,34 @@ impl FixtureRepo {
             ))
             .args(["-c", "init.templateDir=", "-c", "advice.detachedHead=false"])
             .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", self.home.join("gitconfig"))
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", &self.home)
-            .env("GIT_AUTHOR_NAME", "Fixture Author")
-            .env("GIT_AUTHOR_EMAIL", "author@example.invalid")
             .env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_NAME", "Fixture Committer")
-            .env("GIT_COMMITTER_EMAIL", "committer@example.invalid")
-            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date);
+        self.isolated_env()
+            .into_iter()
+            .fold(cmd, |cmd, (k, v)| cmd.env(k, v))
+    }
+
+    /// The environment that keeps git away from the developer's own config: no system or
+    /// global config (the fixture's own, possibly missing, file instead) and a fixed identity.
+    /// For code under test that builds its own git commands.
+    pub fn isolated_env(&self) -> Vec<(OsString, OsString)> {
+        let home = self.home.as_os_str().to_os_string();
+        vec![
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            (
+                "GIT_CONFIG_GLOBAL".into(),
+                self.home.join("gitconfig").into_os_string(),
+            ),
+            ("HOME".into(), home.clone()),
+            ("XDG_CONFIG_HOME".into(), home),
+            ("GIT_AUTHOR_NAME".into(), "Fixture Author".into()),
+            ("GIT_AUTHOR_EMAIL".into(), "author@example.invalid".into()),
+            ("GIT_COMMITTER_NAME".into(), "Fixture Committer".into()),
+            (
+                "GIT_COMMITTER_EMAIL".into(),
+                "committer@example.invalid".into(),
+            ),
+        ]
     }
 
     fn tick(&self) {

@@ -6,6 +6,7 @@
 //! - `task` ([`TaskEvent`]): background task started, progressed, finished.
 //! - `repo-changed` ([`RepoChanged`]): files changed in watched projects; re-read their state.
 //! - `themes-changed` ([`ThemeList`]): a file in the themes folder changed.
+//! - `op-log` ([`OpEntry`]): a write action ran a git command or took a backup.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -17,12 +18,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use ts_rs::TS;
 
-use crate::backup::unix_now;
+use crate::actions::{
+    self, Action, ActionOutcome, OpEntry, OpLog, Preview, Repo, RunOptions, StashEntry,
+};
+use crate::backup::{BackupRecord, Backups, RestorePreview, Retention, unix_now};
 use crate::git::state::{RepoState, read_state};
 use crate::git::watch::{DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, RepoWatcher};
 use crate::git::{GitInstall, detect};
 use crate::github::{Account, AuthStatus, DevicePrompt, GitHub, GitHubError};
-use crate::history::diff::{self, Blame, CommitDetail, FileDiff, parse_commit};
+use crate::history::diff::{self, Blame, CommitDetail, FileDiff, WorkSide, WorkStat, parse_commit};
 use crate::history::graph::{self, Graph, GraphInfo, GraphOptions, GraphRow};
 use crate::history::search::{LogQuery, SearchResult, search};
 use crate::ipc::{AppError, ErrorKind, EventSink, TaskEvent, TaskId, TaskInfo, TaskManager};
@@ -69,6 +73,8 @@ pub struct AppState {
     graph_generation: Arc<AtomicU64>,
     /// Latest search number per project; a running search stops when it is no longer the latest.
     searches: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Every git command and backup a write action ran.
+    oplog: OpLog,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -116,12 +122,18 @@ impl AppState {
             watcher: Mutex::new(watcher),
             watched,
             github: Arc::new(GitHub::production(&data_dir)),
-            data_dir,
+            data_dir: data_dir.clone(),
             _themes_watcher: watch_themes(app.clone(), themes_dir.clone()),
             themes_dir,
             graphs: Default::default(),
             graph_generation: Arc::new(AtomicU64::new(1)),
             searches: Default::default(),
+            oplog: {
+                let handle = app.clone();
+                OpLog::persistent(data_dir.join("oplog.jsonl"), move |e| {
+                    let _ = handle.emit("op-log", e);
+                })
+            },
         })
     }
 
@@ -612,6 +624,131 @@ pub async fn file_diff(
     .await
 }
 
+/// One file's uncommitted change: `staged` (HEAD to the index) or `unstaged` (the index to
+/// the working tree). Size limits as for `file_diff`.
+#[tauri::command]
+pub async fn work_diff(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+    side: WorkSide,
+    context: Option<u32>,
+    force: bool,
+) -> Result<FileDiff, AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || {
+        inspect(&root)?;
+        let repo = crate::git::state::open(&root)?;
+        diff::work_diff(&repo, &path, side, context.unwrap_or(3), force)
+    })
+    .await
+}
+
+/// Show a project's folder in the system file manager, or with `path` (relative to the project)
+/// that file selected in its folder. Only registered projects can be opened this way.
+#[tauri::command]
+pub async fn open_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    path: Option<String>,
+) -> Result<(), AppError> {
+    use tauri_plugin_opener::OpenerExt;
+    let root = state.entry(&id)?.path;
+    let result = match path {
+        None => app.opener().open_path(root.to_string_lossy(), None::<&str>),
+        Some(p) => {
+            crate::actions::check_path(&p)?;
+            let target = root.join(&p);
+            // A deleted file has nothing to select: show the folder it was in.
+            let target = if target.exists() {
+                target
+            } else {
+                target.parent().unwrap_or(&root).to_path_buf()
+            };
+            app.opener().reveal_item_in_dir(target)
+        }
+    };
+    result.map_err(|e| AppError::invalid(format!("Could not open the folder: {e}")))
+}
+
+/// The entries of one folder of a project (`""` is the top), for the Files view.
+#[tauri::command]
+pub async fn files_list(
+    state: State<'_, AppState>,
+    id: String,
+    dir: String,
+) -> Result<crate::files::FileList, AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || crate::files::list_dir(&root, &dir)).await
+}
+
+/// A text file of a project, for the editor.
+#[tauri::command]
+pub async fn file_read(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> Result<crate::files::FileText, AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || crate::files::read_text(&root, &path)).await
+}
+
+/// Save a text file of a project. The file is the user's own edit, so no restore point is taken.
+#[tauri::command]
+pub async fn file_write(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+    content: String,
+) -> Result<(), AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || crate::files::write_text(&root, &path, &content)).await
+}
+
+/// Make a new empty file or folder in a project, for the Files view.
+#[tauri::command]
+pub async fn file_create(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+    dir: bool,
+) -> Result<(), AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || crate::files::create(&root, &path, dir)).await
+}
+
+/// What kind of conflict a file is in and where the two sides disagree (the Changes view).
+#[tauri::command]
+pub async fn conflict_info(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> Result<crate::git::conflict::ConflictInfo, AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || {
+        inspect(&root)?;
+        Ok(crate::git::conflict::describe(&root, &path)?)
+    })
+    .await
+}
+
+/// Lines added and removed in each of the given uncommitted files (the Changes list).
+#[tauri::command]
+pub async fn work_stats(
+    state: State<'_, AppState>,
+    id: String,
+    files: Vec<(String, WorkSide)>,
+) -> Result<Vec<WorkStat>, AppError> {
+    let root = state.entry(&id)?.path;
+    blocking(move || {
+        inspect(&root)?;
+        let repo = crate::git::state::open(&root)?;
+        Ok(diff::work_stats(&repo, &files))
+    })
+    .await
+}
+
 /// Who last changed each line of a file, as of a commit.
 #[tauri::command]
 pub async fn file_blame(
@@ -628,4 +765,162 @@ pub async fn file_blame(
         diff::blame(&repo, commit, &path)
     })
     .await
+}
+
+/// What a write action would do. For a dangerous action the preview's `token` must be passed
+/// to `action_run`; it stops working when the repository changes.
+#[tauri::command]
+pub async fn action_preview(
+    state: State<'_, AppState>,
+    id: String,
+    action: Action,
+    allow_untrusted: bool,
+) -> Result<Preview, AppError> {
+    let entry = state.entry(&id)?;
+    blocking(move || actions::preview(&Repo::new(&entry.path), &action, allow_untrusted)).await
+}
+
+/// The stashes of a project, newest first. Each is named by its commit id.
+#[tauri::command]
+pub async fn stash_list(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<StashEntry>, AppError> {
+    let entry = state.entry(&id)?;
+    blocking(move || {
+        inspect(&entry.path)?;
+        actions::list_stashes(&Repo::new(&entry.path))
+    })
+    .await
+}
+
+/// Start a write action as a task and return its id; the [`ActionOutcome`] arrives in the
+/// task's `finished` event. One task per repository at a time.
+#[tauri::command]
+pub fn action_run(
+    state: State<'_, AppState>,
+    id: String,
+    action: Action,
+    token: Option<String>,
+    allow_untrusted: bool,
+) -> Result<TaskId, AppError> {
+    let entry = state.entry(&id)?;
+    let log = state.oplog.clone();
+    let kind = format!("action-{}", action.name());
+    let title = format!("{} in {}", action.name(), entry.name);
+    state
+        .tasks
+        .spawn(&kind, title, Some(entry.path.clone()), move |ctx| {
+            let opts = RunOptions {
+                allow_untrusted,
+                ..Default::default()
+            };
+            let repo = Repo::new(&entry.path);
+            let outcome: ActionOutcome = actions::run(
+                &repo,
+                &action,
+                token.as_deref(),
+                &opts,
+                &log,
+                &ctx.cancel,
+                |p| ctx.progress(p),
+            )?;
+            if outcome.backup.is_some() {
+                prune_backups(&entry.path);
+            }
+            Ok(outcome)
+        })
+}
+
+/// Apply the default retention after a new backup. A failure only costs disk space.
+fn prune_backups(root: &std::path::Path) {
+    match Backups::open(root).and_then(|b| b.prune(Retention::default(), unix_now())) {
+        Ok(gone) if !gone.is_empty() => log::info!("pruned backups: {}", gone.join(", ")),
+        Ok(_) => {}
+        Err(e) => log::warn!("could not prune backups in {}: {e}", root.display()),
+    }
+}
+
+/// The restore points of a project, newest first.
+#[tauri::command]
+pub async fn backups_list(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<BackupRecord>, AppError> {
+    let entry = state.entry(&id)?;
+    blocking(move || {
+        inspect(&entry.path)?;
+        Ok(Backups::open(&entry.path).and_then(|b| b.list())?)
+    })
+    .await
+}
+
+/// What restoring a restore point would change.
+#[tauri::command]
+pub async fn backup_preview(
+    state: State<'_, AppState>,
+    id: String,
+    backup: String,
+) -> Result<RestorePreview, AppError> {
+    let entry = state.entry(&id)?;
+    blocking(move || {
+        inspect(&entry.path)?;
+        Ok(Backups::open(&entry.path).and_then(|b| b.preview(&backup))?)
+    })
+    .await
+}
+
+/// Return a project to a restore point, as a task. A new restore point of the current state is
+/// taken first, so the restore can be undone too.
+#[tauri::command]
+pub fn backup_restore(
+    state: State<'_, AppState>,
+    id: String,
+    backup: String,
+) -> Result<TaskId, AppError> {
+    let entry = state.entry(&id)?;
+    let log = state.oplog.clone();
+    let title = format!("restore in {}", entry.name);
+    state.tasks.spawn(
+        "action-restore",
+        title,
+        Some(entry.path.clone()),
+        move |_ctx| {
+            let label = Repo::new(&entry.path).label();
+            let started = std::time::Instant::now();
+            let result =
+                Backups::open(&entry.path).and_then(|b| b.restore(&backup, &Default::default()));
+            match result {
+                Ok(out) => {
+                    log.backup(
+                        &label,
+                        "restore",
+                        Ok(&out.pre_restore.id),
+                        started.elapsed(),
+                    );
+                    prune_backups(&entry.path);
+                    Ok(ActionOutcome {
+                        title: format!("Restored {backup}"),
+                        backup: Some(out.pre_restore),
+                        conflicts: Vec::new(),
+                    })
+                }
+                Err(e) => {
+                    log.backup(&label, "restore", Err(e.to_string()), started.elapsed());
+                    Err(AppError::from(e))
+                }
+            }
+        },
+    )
+}
+
+/// The operation log, oldest first.
+#[tauri::command]
+pub fn op_log(state: State<'_, AppState>) -> Vec<OpEntry> {
+    state.oplog.entries()
+}
+
+#[tauri::command]
+pub fn op_log_clear(state: State<'_, AppState>) {
+    state.oplog.clear();
 }

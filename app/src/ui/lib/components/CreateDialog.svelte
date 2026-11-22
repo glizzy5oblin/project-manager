@@ -46,6 +46,7 @@
         <span>Project name</span>
         <!-- svelte-ignore a11y_autofocus -->
         <input
+            title="The name of the new project's folder"
             bind:value={name}
             autofocus
             spellcheck="false"
@@ -66,8 +67,15 @@
         <ErrorBox {error} />
     {/if}
     {#snippet actions()}
-        <button type="button" onclick={onclose}>Cancel</button>
         <button
+            title="Close without creating anything"
+            type="button"
+            onclick={onclose}
+        >
+            Cancel
+        </button>
+        <button
+            title="Create the project and add it to your list of projects"
             type="button"
             class="primary"
             disabled={!name || !!nameProblem || !parent || busy}

@@ -3,4 +3,4 @@
 /**
  * The view shown inside a project tab.
  */
-export type ProjectView = "overview" | "graph" | "log" | "staging" | "releases" | "settings";
+export type ProjectView = "overview" | "graph" | "log" | "changes" | "files" | "staging" | "releases" | "activity" | "settings";

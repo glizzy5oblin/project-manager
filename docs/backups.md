@@ -8,13 +8,16 @@ in `app/src/desktop/src/backup/`.
 
 A backup with id `<id>` is a set of refs under `refs/pm/backups/<id>/`:
 
-| Ref              | Contents                                                                      |
-| ---------------- | ----------------------------------------------------------------------------- |
-| `head`           | The commit HEAD pointed at. Absent on an unborn branch.                       |
-| `heads/<branch>` | Every local branch tip.                                                       |
-| `tags/<tag>`     | Every tag. Annotated tags keep their tag object.                              |
-| `index`          | A commit whose tree is the staged index. Absent when the index had conflicts. |
-| `worktree`       | A commit whose tree is the whole working tree, untracked files included.      |
+| Ref              | Contents                                                                 |
+| ---------------- | ------------------------------------------------------------------------ |
+| `head`           | The commit HEAD pointed at. Absent on an unborn branch.                  |
+| `heads/<branch>` | Every local branch tip.                                                  |
+| `tags/<tag>`     | Every tag. Annotated tags keep their tag object.                         |
+| `index`          | A commit whose tree is the staged index, conflicted entries left out.    |
+| `pending/<n>`    | The commits a merge, cherry-pick or revert in progress was applying.     |
+| `blobs/<n>`      | The file versions of each conflicted entry (base, ours, theirs).         |
+| `stash/<n>`      | Each stash commit, newest first, so a dropped stash is not lost.         |
+| `worktree`       | A commit whose tree is the whole working tree, untracked files included. |
 
 Ignored files are not backed up. Nothing an action does touches them either, except
 `git clean -x`, which Project Manager does not run.
@@ -29,8 +32,10 @@ is added when two backups are taken in the same second.
 ## Backup index
 
 `<git dir>/pm/backups.json` lists the backups for the Undo UI: id, action, time, HEAD branch
-and commit, branch and tag tips, untracked files, whether the index had conflicts, whether the
-repo uses Git LFS, and the bundle path if one was written. It lives in the git dir so it is never
+and commit, branch and tag tips, untracked files, the conflicted index entries (as
+`git ls-files -u` prints them), the operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+`REVERT_HEAD`, `MERGE_MSG`, `MERGE_MODE`), whether the repo uses Git LFS, and the bundle path if one
+was written. It lives in the git dir so it is never
 committed and moves with the repository. If a backup fails part-way, its refs are deleted and no
 entry is written.
 
@@ -53,14 +58,27 @@ Restoring takes a new backup first (action `restore`), so a restore can itself b
 3. HEAD is pointed back at the backed-up branch, or detached at the backed-up commit.
 4. The working tree is reset and cleaned (ignored files are kept), then the snapshot is checked
    out over it. Files that were deleted at backup time are removed again.
-5. The index is set back to the backed-up index commit and refreshed.
+5. The index is set back to the backed-up index commit, and the conflicted entries are put back
+   with their stages (`git update-index --index-info`).
+6. A merge, cherry-pick or revert that was in progress is put back (`MERGE_HEAD`, `MERGE_MSG`,
+   `MERGE_MODE`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`), so it can be finished or aborted as before.
+   The index is refreshed.
+7. The stash list is put back as it was, with stashes made since kept on top. Git can only
+   push a stash onto the top of the list, so when the list differs it is emptied and stored
+   again, oldest first, with their original messages. Every stash commit stays reachable from
+   the backups meanwhile.
 
-A conflicted index cannot be stored as a tree. In that case the conflicted file contents (with
-their markers) are restored in the working tree, and the outcome carries a warning that the
-conflicts are no longer marked in the index.
+So undoing "Abort the merge" returns the repository to mid-merge: the same conflicts, the
+resolutions already made, and `git commit` concluding the merge. A rebase or sequencer in progress
+is not brought back (step 1); its own state lives in folders that change at every step.
 
-Git hooks never run during backup or restore (`core.hooksPath` is pointed at an empty path),
-and commit signing is disabled for the snapshot commits.
+Backups taken by older versions with a conflicted index have no `index` ref. Restoring one puts
+back the conflicted file contents (with their markers) and warns that the conflicts are no longer
+marked in the index.
+
+Git hooks never run during backup or restore: `core.hooksPath` points at `<git dir>/pm/no-hooks`,
+an empty regular file, so git finds no hooks and tools that install hooks there (git-lfs) cannot
+write any. Commit signing is disabled for the snapshot commits.
 
 ## Retention
 

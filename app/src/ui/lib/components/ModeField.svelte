@@ -21,7 +21,13 @@
     <legend>Workflow</legend>
     {#each modes as m (m.id)}
         <label>
-            <input type="radio" name="mode" value={m.id} bind:group={value} />
+            <input
+                title={m.hint}
+                type="radio"
+                name="mode"
+                value={m.id}
+                bind:group={value}
+            />
             <span>
                 <strong>{m.label}</strong>
                 <small>{m.hint}</small>

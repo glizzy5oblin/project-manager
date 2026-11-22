@@ -113,6 +113,39 @@ fn conflict_is_reported_once_with_operation() {
 }
 
 #[test]
+fn merge_message_is_read_without_comments_and_only_during_a_merge() {
+    let r = conflict();
+    assert_eq!(read_state(r.path(), false).unwrap().merge_message, None);
+
+    start_conflict(&r);
+    let git_dir = r.path().join(".git");
+    let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap();
+    assert!(
+        raw.lines().any(|l| l.starts_with('#')),
+        "git wrote comments: {raw:?}"
+    );
+    let msg = read_state(r.path(), false).unwrap().merge_message.unwrap();
+    assert_eq!(msg, "Merge branch 'topic'");
+
+    // Too large: left out rather than shown cut short.
+    std::fs::write(git_dir.join("MERGE_MSG"), "x".repeat(64 * 1024 + 1)).unwrap();
+    assert_eq!(read_state(r.path(), false).unwrap().merge_message, None);
+
+    // A symlink is not followed, so another file's contents never reach the editor.
+    #[cfg(unix)]
+    {
+        let secret = r.path().join("secret.txt");
+        std::fs::write(&secret, "do not show").unwrap();
+        std::fs::remove_file(git_dir.join("MERGE_MSG")).unwrap();
+        std::os::unix::fs::symlink(&secret, git_dir.join("MERGE_MSG")).unwrap();
+        assert_eq!(read_state(r.path(), false).unwrap().merge_message, None);
+    }
+
+    r.git(&["merge", "--abort"]);
+    assert_eq!(read_state(r.path(), false).unwrap().merge_message, None);
+}
+
+#[test]
 fn unborn_and_detached_heads() {
     let r = FixtureRepo::new();
     let s = read_state(r.path(), true).unwrap();
