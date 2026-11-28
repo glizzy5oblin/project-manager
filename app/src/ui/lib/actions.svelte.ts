@@ -7,6 +7,7 @@ import type { Action } from "./bindings/Action";
 import type { ActionOutcome } from "./bindings/ActionOutcome";
 import type { AppError } from "./bindings/AppError";
 import type { Preview } from "./bindings/Preview";
+import type { RepoSide } from "./bindings/RepoSide";
 import type { TaskOutcome } from "./bindings/TaskOutcome";
 import { tasks } from "./tasks.svelte";
 
@@ -25,12 +26,14 @@ export type RunnerDeps = {
         id: string,
         action: Action,
         allowUntrusted: boolean,
+        side: RepoSide,
     ) => Promise<Preview>;
     run: (
         id: string,
         action: Action,
         token: string | null,
         allowUntrusted: boolean,
+        side: RepoSide,
     ) => Promise<number>;
     wait: (task: number) => Promise<TaskOutcome>;
 };
@@ -73,10 +76,11 @@ export class ActionRunner {
         projectId: string,
         action: Action,
         confirm = false,
+        side: RepoSide = "private",
     ): Promise<ActionOutcome | null> {
         this.busy[projectId] = (this.busy[projectId] ?? 0) + 1;
         try {
-            return await this.#run(projectId, action, confirm);
+            return await this.#run(projectId, action, confirm, side);
         } finally {
             const n = (this.busy[projectId] ?? 1) - 1;
             if (n > 0) this.busy[projectId] = n;
@@ -88,6 +92,7 @@ export class ActionRunner {
         projectId: string,
         action: Action,
         confirm: boolean,
+        side: RepoSide,
     ): Promise<ActionOutcome | null> {
         let untrusted = false;
         let note: string | null = null;
@@ -98,12 +103,18 @@ export class ActionRunner {
                     projectId,
                     action,
                     untrusted,
+                    side,
                 );
             } catch (e) {
                 if ((e as AppError).kind !== "untrusted" || untrusted) throw e;
                 // Ask once with the warning, then preview as allowed.
                 untrusted = true;
-                preview = await this.#deps.preview(projectId, action, true);
+                preview = await this.#deps.preview(
+                    projectId,
+                    action,
+                    true,
+                    side,
+                );
             }
             if (preview.dangerous || untrusted || confirm || note) {
                 if (!(await this.#ask(preview, untrusted, note))) return null;
@@ -113,6 +124,7 @@ export class ActionRunner {
                 action,
                 preview.dangerous ? preview.token : null,
                 untrusted,
+                side,
             );
             const outcome = await this.#deps.wait(task);
             if (outcome.status === "ok") return outcome.value as ActionOutcome;

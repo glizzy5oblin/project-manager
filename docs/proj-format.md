@@ -1,6 +1,8 @@
 # `.proj` file format
 
-Each Project Manager project has one `<name>.proj` file in its private repository root. It is TOML. Project Manager edits it in place and keeps your comments and layout; only the values it changes are rewritten.
+Each Project Manager project has one `<name>.proj` file at its project root — the folder that holds the file, which is where Project Manager looks for it. It is TOML. Project Manager edits it in place and keeps your comments and layout; only the values it changes are rewritten.
+
+In two-repo mode the project root is a plain folder beside two repositories, `private/` (the working repo) and `public/` (the release repo), both described by the `.proj`; in single-repo mode the project root IS the repository. The `.proj` is also read from one level down, for backward compatibility with the old layout (the proj inside the `private/` folder, with `path = "."` and `path = "../public"`).
 
 Project Manager looks for exactly one `*.proj` file in the folder. None, or more than one, is an error.
 
@@ -17,12 +19,12 @@ version = "0.0.1"
 mode = "two-repo"
 
 [workflow.private]
-path = "."
+path = "./private"
 branch = "main"
 remote = "origin"
 
 [workflow.public]
-path = "../ExampleProject-public"
+path = "./public"
 branch = "main"
 remote = "origin"
 
@@ -82,17 +84,41 @@ Which private files are copied to the public side.
 | `overrides.include` | Manual per-file choices that force a file in.                        |
 | `overrides.exclude` | Manual per-file choices that force a file out.                       |
 
-Precedence, later wins: built-in defaults (for example `.md` files other than README.md, CHANGELOG.md and LICENSE stay private), then `include`/`exclude`, then `overrides`. All paths are relative to the project and must not use `..` or be absolute. `!` is only allowed in `include`.
+Precedence, later wins: built-in defaults (for example `.md` files other than README.md, CHANGELOG.md and LICENSE stay private), then `include`/`exclude`, then `overrides`. All paths are relative to the private repository and must not use `..` or be absolute. `!` is only allowed in `include`.
+
+`[staging.map]` publishes a private file under another name, for a public file that must differ from its private namesake (a public Makefile without the private targets, say):
+
+```toml
+[staging.map]
+"publish/Makefile" = "Makefile"
+"publish/gitignore" = ".gitignore"
+```
+
+The public `Makefile` is then copied from `publish/Makefile` alone: the private `Makefile` is never staged, `publish/Makefile` is not staged under its own name, and the release zip's allowlist check accepts the public `Makefile`. The include and exclude globs do not apply to mapped files. Each public name may be the target of one entry only.
 
 ### `[release]`
 
-| Key             | Default                  | Meaning                                                |
-| --------------- | ------------------------ | ------------------------------------------------------ |
-| `version_files` | `[]`                     | Files whose version string is bumped with the project. |
-| `asset_name`    | `"{name}-{version}.zip"` | Release zip name. Placeholders: `{name}`, `{version}`. |
-| `targets`       | `[]`                     | `[[release.targets]]` entries with a `kind`.           |
+| Key               | Default                                                                       | Meaning                                                                                          |
+| ----------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `version_files`   | `[]`                                                                          | Files in the private repository whose version string is bumped with the project (relative to it). |
+| `asset_name`      | `"{name}-{version}.zip"`                                                      | Release zip name. Placeholders: `{name}`, `{version}`.                                           |
+| `changelog_groups` | conventional prefixes (`["feat", "fix", "perf", "docs", "refactor", "test", "build", "ci", "chore"]`), in display order | Conventional-commit prefixes the release notes group by. Commits matching none of them land in an "Other changes" group. Lowercase, no duplicates — validated. |
+| `targets`         | `[]`                                                                          | `[[release.targets]]` entries with a `kind`.                                                      |
+| `history`         | `[]`                                                                          | `[[release.history]]` entries with a `tag`, `version` and `date`. See below.                     |
 
 `kind = "github"` is the only target for now. Each kind may appear once.
+
+Release notes are generated from the commits on the private branch since the last tag (merge commits excluded), grouped by `changelog_groups`, and rendered as markdown in the release view. The editor edits the generated markdown in place; the preview shows exactly what would be published.
+
+### `[[release.history]]`
+
+| Key      | Meaning                                                                |
+| -------- | ---------------------------------------------------------------------- |
+| `tag`    | The annotated tag, e.g. `v1.2.3`. Identifies the entry — idempotent by tag. |
+| `version` | The released version, `1.2.3`.                                          |
+| `date`   | The tag's date (`YYYY-MM-DD`), as recorded.                            |
+
+The history table records a release the moment its annotated tag is created (before any push). A tag that is already recorded is left alone, and the history is otherwise hand-editable — the UI lists it verbatim.
 
 ## Errors
 

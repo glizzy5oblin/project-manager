@@ -56,7 +56,13 @@ describe("ActionRunner", () => {
         const out = await runner.run("p", stage);
         expect(out?.title).toBe("Done");
         expect(runner.pending).toBe(null);
-        expect(deps.run).toHaveBeenCalledWith("p", stage, null, false);
+        expect(deps.run).toHaveBeenCalledWith(
+            "p",
+            stage,
+            null,
+            false,
+            "private",
+        );
         expect(runner.busy).toEqual({});
     });
 
@@ -66,7 +72,13 @@ describe("ActionRunner", () => {
         expect(runner.busy).toEqual({ p: 1 });
         await answer(runner, true);
         await done;
-        expect(deps.run).toHaveBeenCalledWith("p", reset, "tok", false);
+        expect(deps.run).toHaveBeenCalledWith(
+            "p",
+            reset,
+            "tok",
+            false,
+            "private",
+        );
     });
 
     it("runs nothing when the user cancels", async () => {
@@ -87,7 +99,13 @@ describe("ActionRunner", () => {
         await vi.waitFor(() => expect(runner.pending?.note).toMatch(/changed/));
         runner.pending!.answer(true);
         await done;
-        expect(deps.run).toHaveBeenLastCalledWith("p", reset, "new", false);
+        expect(deps.run).toHaveBeenLastCalledWith(
+            "p",
+            reset,
+            "new",
+            false,
+            "private",
+        );
     });
 
     it("asks with a warning before writing to an untrusted repository", async () => {
@@ -99,8 +117,19 @@ describe("ActionRunner", () => {
         await vi.waitFor(() => expect(runner.pending?.untrusted).toBe(true));
         runner.pending!.answer(true);
         await done;
-        expect(deps.preview).toHaveBeenLastCalledWith("p", stage, true);
-        expect(deps.run).toHaveBeenCalledWith("p", stage, null, true);
+        expect(deps.preview).toHaveBeenLastCalledWith(
+            "p",
+            stage,
+            true,
+            "private",
+        );
+        expect(deps.run).toHaveBeenCalledWith(
+            "p",
+            stage,
+            null,
+            true,
+            "private",
+        );
     });
 
     it("rejects with the task's error and clears the busy count", async () => {

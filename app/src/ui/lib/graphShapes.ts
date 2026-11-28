@@ -35,6 +35,8 @@ export type NodeShape = {
     /** Merge commits are hollow. */
     hollow: boolean;
     faded: boolean;
+    /** Whether the commit is on the public side (an ancestor of the last synced commit). */
+    staged: boolean;
     /** Ring drawn around the node: the selected commit, or HEAD. */
     ring: "selected" | "head" | null;
 };
@@ -84,6 +86,7 @@ export function graphShapes(o: ShapeOptions): GraphShapes {
             color: colorOf(r.color),
             hollow: r.parents.length > 1,
             faded: faded(r),
+            staged: r.staged,
             ring:
                 r.row === o.selectedRow
                     ? "selected"

@@ -15,6 +15,8 @@ export type NameForm = { kind: "create" } | { kind: "rename"; from: string };
 export type CommitCommand =
     | { type: "form"; form: NameForm }
     | { type: "action"; action: Action }
+    /** Open the commit editor on the current branch's commits from this one on. */
+    | { type: "edit" }
     | { type: "copy"; text: string };
 
 export interface CommitMenu {
@@ -28,6 +30,52 @@ const RESET_LABEL: Record<ResetMode, string> = {
     hard: "discard changes",
 };
 
+/** Why this commit cannot be copied onto the branch you are on, or null when it can. */
+export function pickBlocked(
+    commit: string,
+    head: HeadState | null,
+): string | null {
+    if (!head?.commit) return "This project has no commits yet";
+    if (head.commit === commit)
+        return "This is the checked-out commit: it is already on your branch";
+    return null;
+}
+
+/** Why this commit cannot be undone with a new commit, or null when it can. */
+export function revertBlocked(head: HeadState | null): string | null {
+    return head?.commit ? null : "This project has no commits yet";
+}
+
+/** Why the branch you are on cannot be rebased onto `r`, or null when it can. */
+export function rebaseBlocked(
+    r: RefLabel,
+    commit: string,
+    head: HeadState | null,
+): string | null {
+    if (!head?.branch)
+        return "Check out a branch first: you are not on one right now";
+    if (r.isHead) return "This is the branch you are on";
+    if (head.commit === commit)
+        return "Nothing to rebase: your branch is already at this commit";
+    return null;
+}
+
+/**
+ * Why the current branch's commits from this one on cannot be edited, or null when they may
+ * be. Whether the commit is on the branch at all is checked when the editor opens.
+ */
+export function editBlocked(
+    parents: string[] | null,
+    head: HeadState | null,
+): string | null {
+    if (!head?.commit) return "This project has no commits yet";
+    if (!head.branch)
+        return "Check out a branch first: you are not on one right now";
+    if (parents && parents.length > 1)
+        return "This is a merge commit: history across a merge cannot be edited here. Start from a commit after it";
+    return null;
+}
+
 /** What a menu item does, in plain words, shown on hover. */
 function hintFor(id: string): string | undefined {
     if (id === "new-branch") return "Start a new branch from this commit";
@@ -37,6 +85,14 @@ function hintFor(id: string): string | undefined {
         return "Move the branch to this commit and keep your changes, unstaged";
     if (id === "reset-hard")
         return "Move the branch to this commit and throw away your changes. A backup is taken first";
+    if (id === "cherry-pick")
+        return "Copy this commit's change onto the branch you are on, as a new commit";
+    if (id === "revert")
+        return "Add a new commit that undoes this commit's change. History is kept";
+    if (id === "edit-from")
+        return "Reorder, squash, drop or reword your branch's commits from this one on. They get new ids; a backup is taken first";
+    if (id.startsWith("rebase:"))
+        return "Move your branch's own commits so they start from this branch's tip. They get new ids; a backup is taken first";
     if (id.startsWith("checkout:")) return "Switch your files to this branch";
     if (id.startsWith("merge:"))
         return "Bring this branch's commits into the branch you are on";
@@ -56,6 +112,8 @@ export function commitMenu(c: {
     refs: RefLabel[];
     head: HeadState | null;
     busy: boolean;
+    /** The commit's parents, when known: a merge cannot start an edit. */
+    parents?: string[];
 }): CommitMenu {
     const items: MenuItem[] = [];
     const commands: Record<string, CommitCommand> = {};
@@ -130,6 +188,38 @@ export function commitMenu(c: {
         );
     }
 
+    group();
+    add(
+        "cherry-pick",
+        `Cherry-pick onto ${current ?? "HEAD"}`,
+        { type: "action", action: { type: "cherryPick", commit: c.commit } },
+        {},
+        pickBlocked(c.commit, c.head),
+    );
+    add(
+        "revert",
+        "Revert this commit",
+        { type: "action", action: { type: "revert", commit: c.commit } },
+        {},
+        revertBlocked(c.head),
+    );
+    add(
+        "edit-from",
+        `Edit ${current ?? "branch"} commits from here…`,
+        { type: "edit" },
+        { danger: true },
+        editBlocked(c.parents ?? null, c.head),
+    );
+
+    const rebase = (r: RefLabel) =>
+        add(
+            `rebase:${r.name}`,
+            `Rebase ${current ?? "HEAD"} onto ${r.name}`,
+            { type: "action", action: { type: "rebase", onto: r.name } },
+            { danger: true },
+            rebaseBlocked(r, c.commit, c.head),
+        );
+
     for (const b of branches) {
         group();
         add(
@@ -152,6 +242,7 @@ export function commitMenu(c: {
             {},
             mergeWhy(b),
         );
+        rebase(b);
         add(`rename:${b.name}`, `Rename ${b.name}…`, {
             type: "form",
             form: { kind: "rename", from: b.name },
@@ -182,6 +273,7 @@ export function commitMenu(c: {
             {},
             mergeWhy(r),
         );
+        rebase(r);
     }
 
     group();

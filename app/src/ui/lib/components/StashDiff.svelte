@@ -4,6 +4,7 @@
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { ChangedFile } from "../bindings/ChangedFile";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { StashEntry } from "../bindings/StashEntry";
     import { formatTime } from "../history";
     import { stashTitle } from "../stash";
@@ -13,10 +14,13 @@
 
     let {
         projectId,
+        side = "private",
         stash,
         diffMode = $bindable("unified"),
     }: {
         projectId: string;
+        /** Which repository of a two-repo project this stash is in. */
+        side?: RepoSide;
         stash: StashEntry;
         diffMode?: "unified" | "split";
     } = $props();
@@ -51,18 +55,19 @@
     );
 
     $effect(() => {
-        const [id, commit, third] = [
+        const [id, commit, third, s] = [
             projectId,
             stash.commit,
             stash.untrackedCommit,
+            side,
         ];
         const mine = ++request;
         loading = true;
         error = null;
         void (async () => {
-            const tracked = await api.commitDetail(id, commit, 0);
+            const tracked = await api.commitDetail(id, commit, 0, s);
             const untracked = third
-                ? await api.commitDetail(id, third, null)
+                ? await api.commitDetail(id, third, null, s)
                 : null;
             return { tracked, untracked };
         })().then(
@@ -184,6 +189,7 @@
                 {#key key(selected)}
                     <DiffView
                         {projectId}
+                        {side}
                         commit={selected.commit}
                         parent={selected.parent}
                         file={selected.file}

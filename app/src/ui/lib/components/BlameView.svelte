@@ -3,6 +3,7 @@
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { Blame } from "../bindings/Blame";
+    import type { RepoSide } from "../bindings/RepoSide";
     import { highlight } from "../highlight";
     import {
         formatDay,
@@ -16,11 +17,14 @@
 
     let {
         projectId,
+        side = "private",
         commit,
         path,
         onjump,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project this file is in. */
+        side?: RepoSide;
         commit: string;
         path: string;
         onjump: (commit: string) => void;
@@ -34,13 +38,13 @@
     let request = 0;
 
     $effect(() => {
-        const [p, c, f] = [projectId, commit, path];
+        const [p, c, f, s] = [projectId, commit, path, side];
         const mine = ++request;
         blame = null;
         error = null;
         tokens = null;
         limit = STEP;
-        api.fileBlame(p, c, f).then(
+        api.fileBlame(p, c, f, s).then(
             async (b) => {
                 if (mine !== request) return;
                 blame = b;

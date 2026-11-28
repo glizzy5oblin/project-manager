@@ -10,6 +10,7 @@
     import type { ChangedFile } from "../bindings/ChangedFile";
     import type { GitVersion } from "../bindings/GitVersion";
     import type { Hunk } from "../bindings/Hunk";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { RepoState } from "../bindings/RepoState";
     import type { StashEntry } from "../bindings/StashEntry";
     import type { WorkSide } from "../bindings/WorkSide";
@@ -26,6 +27,7 @@
         commitProblem,
         followSelection,
         kindLetter,
+        replayControls,
         type ChangeRow,
         type Selection,
     } from "../changes";
@@ -36,9 +38,11 @@
     import StashDiff from "./StashDiff.svelte";
     import Splitter from "./Splitter.svelte";
     import StashPanel from "./StashPanel.svelte";
+    import SyncBar from "./SyncBar.svelte";
 
     let {
         projectId,
+        side = "private",
         repo,
         changed,
         message = $bindable(""),
@@ -48,6 +52,8 @@
         onopenfile,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project the working tree belongs to. */
+        side?: RepoSide;
         repo: RepoState;
         /** Bumped when the project's files change on disk. */
         changed: number;
@@ -107,14 +113,15 @@
     const unstaged = $derived(rows.filter((r) => r.side === "unstaged"));
     const busy = $derived(!!actions.busy[projectId]);
     const unborn = $derived(!repo.head.commit);
-    // git refuses to amend in the middle of a merge, and so does the backend.
-    const merging = $derived(repo.inProgress === "merge");
+    // Amending and stashing wait until no merge, cherry-pick, revert or rebase is in progress;
+    // git refuses to amend mid-merge, and the backend refuses both.
+    const midOperation = $derived(!!repo.inProgress);
     const mergeMessage = $derived(repo.mergeMessage);
     const stashHint = $derived(
         unborn
             ? "There is no commit yet to stash against"
-            : merging
-              ? "Finish or abort the merge first"
+            : midOperation
+              ? `Finish or abort the ${repo.inProgress ? operationLabel(repo.inProgress).toLowerCase() : "operation"} first`
               : conflicted.length
                 ? "Resolve the conflicts first"
                 : !rows.length
@@ -128,7 +135,7 @@
         if (m && !untrack(() => message.trim())) message = m;
     });
     $effect(() => {
-        if (merging) untrack(() => (amend = false));
+        if (midOperation) untrack(() => (amend = false));
     });
     const problem = $derived(
         commitProblem(message, amend, staged.length, conflicted.length),
@@ -153,7 +160,7 @@
             counts = {};
             return;
         }
-        api.workStats(projectId, files).then(
+        api.workStats(projectId, files, side).then(
             (list) => {
                 if (mine !== statsRequest) return;
                 const next: typeof counts = {};
@@ -192,7 +199,7 @@
         error = null;
         notice = "";
         try {
-            const outcome = await actions.run(projectId, action);
+            const outcome = await actions.run(projectId, action, false, side);
             if (!outcome) return false;
             notice = outcomeNotice(outcome, done).text;
             return true;
@@ -255,7 +262,7 @@
                             `Added ${pattern} to .gitignore.`,
                         );
                 } else if (cmd === "show-folder")
-                    api.openFolder(projectId, r.path).catch(
+                    api.openFolder(projectId, r.path, side).catch(
                         (e) => (error = e as AppError),
                     );
                 else if (cmd === "copy-path")
@@ -282,7 +289,12 @@
     async function toggleAmend() {
         if (!amend || message.trim() || !repo.head.commit) return;
         try {
-            const d = await api.commitDetail(projectId, repo.head.commit, null);
+            const d = await api.commitDetail(
+                projectId,
+                repo.head.commit,
+                null,
+                side,
+            );
             if (amend && !message.trim()) message = d.message.trimEnd();
         } catch (e) {
             error = e as AppError;
@@ -387,14 +399,18 @@
 >
     <div class="side" bind:this={sideCol} bind:clientHeight={sideH}>
         <div class="lists">
+            <SyncBar {repo} {busy} {act} />
             {#if repo.inProgress}
+                {@const replay = replayControls(repo.inProgress)}
                 <div class="banner">
                     <span>
                         {operationLabel(repo.inProgress)} in progress.
                         {#if conflicted.length}
                             Git could not combine every change. Click each
                             conflicted file to see why and settle it right here,
-                            then commit.
+                            then {replay ? "press Continue" : "commit"}.
+                        {:else if replay}
+                            {replay.done}
                         {:else}
                             Commit to finish it.
                         {/if}
@@ -407,6 +423,25 @@
                             onclick={() => act({ type: "abortMerge" })}
                         >
                             Abort merge
+                        </button>
+                    {:else if replay}
+                        <button
+                            title={conflicted.length
+                                ? "Settle every conflicted file first"
+                                : replay.continueHint}
+                            type="button"
+                            disabled={busy || conflicted.length > 0}
+                            onclick={() => act({ type: "continue" })}
+                        >
+                            Continue
+                        </button>
+                        <button
+                            title={replay.abortHint}
+                            type="button"
+                            disabled={busy}
+                            onclick={() => act(replay.abort)}
+                        >
+                            Abort {replay.noun}
                         </button>
                     {/if}
                 </div>
@@ -514,6 +549,7 @@
         >
             <StashPanel
                 {projectId}
+                {side}
                 {changed}
                 {busy}
                 canStash={!stashHint}
@@ -539,15 +575,15 @@
                 <label
                     title={unborn
                         ? "There is no commit to amend yet"
-                        : merging
-                          ? "Finish or abort the merge before amending"
+                        : midOperation
+                          ? `Finish or abort the ${repo.inProgress ? operationLabel(repo.inProgress).toLowerCase() : "operation"} before amending`
                           : ""}
                 >
                     <input
                         title="Replace the last commit with this one instead of making a new commit. Avoid this if the last commit is already pushed"
                         type="checkbox"
                         bind:checked={amend}
-                        disabled={unborn || merging || busy}
+                        disabled={unborn || midOperation || busy}
                         onchange={toggleAmend}
                     />
                     Amend last commit
@@ -589,10 +625,11 @@
 
     <div class="diff">
         {#if stash}
-            <StashDiff {projectId} {stash} bind:diffMode />
+            <StashDiff {projectId} {side} {stash} bind:diffMode />
         {:else if selected?.side === "conflicted"}
             <ConflictPanel
                 {projectId}
+                {side}
                 path={selected.path}
                 version={changed}
                 {onreload}
@@ -601,6 +638,7 @@
         {:else if selectedFile}
             <DiffView
                 {projectId}
+                {side}
                 work={selectedSide}
                 version={changed}
                 file={selectedFile}

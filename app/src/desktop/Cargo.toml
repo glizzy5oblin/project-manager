@@ -1,6 +1,6 @@
 [package]
 name = "project-manager"
-version = "0.0.2"
+version = "0.0.3"
 description = "Project Manager: git and GitHub manager for private and public project repos"
 authors = []
 license = ""
@@ -28,6 +28,8 @@ toml = "1.2.1"
 toml_edit = "0.25.19"
 semver = "1.0.28"
 globset = "0.4.21"
+regex = "1.11"
+sha2 = "0.10"
 gix = { version = "0.90.0", default-features = false, features = ["status", "revision", "sha1", "blame"] }
 notify = "8.2.2"
 ts-rs = "12.0.1"
@@ -36,6 +38,7 @@ keyring = "4.2.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "form", "json", "query", "rustls"] }
 tauri-plugin-opener = "2"
 similar = { version = "3.2.1", features = ["inline", "unicode"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 
 [lints.rust]
 unsafe_code = "forbid"

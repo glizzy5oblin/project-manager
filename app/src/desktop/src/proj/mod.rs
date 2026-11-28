@@ -150,6 +150,42 @@ impl ProjFile {
     }
 }
 
+/// The root of a project's private repository, resolved from its `.proj` workflow.
+///
+/// - Two-repo mode: `root` joined with `workflow.private.path` (defaulting to `"."` — a proj
+///   committed inside the private repo, the legacy layout, still resolves to the private repo).
+/// - Single-repo mode: `root` itself (the private side is a branch, not a separate repository).
+pub fn private_root(root: &Path, proj: &ProjFile) -> Result<PathBuf, ProjError> {
+    match proj.workflow.mode {
+        WorkflowMode::TwoRepo => {
+            let rel = proj.workflow.private.path.as_deref().unwrap_or(".");
+            Ok(root.join(rel))
+        }
+        WorkflowMode::SingleRepo => Ok(root.to_path_buf()),
+    }
+}
+
+/// The root of a project's public repository, resolved from its `.proj` workflow.
+///
+/// - Two-repo mode: `root` joined with `workflow.public.path` (the separate public repo).
+/// - Single-repo mode: `root` itself (the public side is a branch, not a separate repository).
+///
+/// Returns an `Invalid` error when two-repo mode is missing `workflow.public.path`.
+pub fn public_root(root: &Path, proj: &ProjFile) -> Result<PathBuf, ProjError> {
+    match proj.workflow.mode {
+        WorkflowMode::TwoRepo => {
+            let rel = proj.workflow.public.path.as_deref().ok_or_else(|| {
+                ProjError::Invalid(vec![Issue {
+                    key: "workflow.public.path".to_string(),
+                    message: "required in two-repo mode".to_string(),
+                }])
+            })?;
+            Ok(root.join(rel))
+        }
+        WorkflowMode::SingleRepo => Ok(root.to_path_buf()),
+    }
+}
+
 /// Find the single `*.proj` file directly inside `dir`.
 pub fn find_proj_file(dir: &Path) -> Result<PathBuf, ProjError> {
     let entries = std::fs::read_dir(dir).map_err(|source| ProjError::Io {

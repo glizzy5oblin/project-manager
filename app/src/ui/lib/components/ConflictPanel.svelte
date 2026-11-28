@@ -7,25 +7,30 @@
     import type { Action } from "../bindings/Action";
     import type { AppError } from "../bindings/AppError";
     import type { ConflictInfo } from "../bindings/ConflictInfo";
+    import type { RepoSide } from "../bindings/RepoSide";
     import {
         type Choice,
         explain,
-        findRegions,
         resolveRegion,
         sideNames,
         steps,
+        textChoice,
         withLineEnds,
+        yourRegions,
     } from "../conflicts";
     import ErrorBox from "./ErrorBox.svelte";
 
     let {
         projectId,
+        side = "private",
         path,
         version,
         onreload,
         onopenfile,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project the conflict is in. */
+        side?: RepoSide;
         path: string;
         /** Changes when the repository does, so the explanation follows edits to the file. */
         version: number;
@@ -45,10 +50,10 @@
     let request = 0;
 
     $effect(() => {
-        const [id, p] = [projectId, path];
+        const [id, p, s] = [projectId, path, side];
         void version;
         const mine = ++request;
-        api.conflictInfo(id, p).then(
+        api.conflictInfo(id, p, s).then(
             (i) => {
                 if (mine !== request) return;
                 info = i;
@@ -68,7 +73,8 @@
 
     const text = $derived(info ? explain(info) : null);
     const names = $derived(info ? sideNames(info) : null);
-    const regions = $derived(findRegions(draft));
+    // Turned round during a rebase, so "You" always shows your own lines.
+    const regions = $derived(yourRegions(draft, !!info?.swapped));
     const edited = $derived(draft !== loaded);
     const busy = $derived(!!actions.busy[projectId]);
     const canEdit = $derived(!!info && info.text !== null);
@@ -88,14 +94,14 @@
             : lines;
 
     function choose(i: number, c: Choice) {
-        draft = resolveRegion(draft, i, c);
+        draft = resolveRegion(draft, i, textChoice(c, !!info?.swapped));
     }
 
     async function act(action: Action) {
         error = null;
         notice = "";
         try {
-            const outcome = await actions.run(projectId, action);
+            const outcome = await actions.run(projectId, action, false, side);
             if (outcome) notice = outcomeNotice(outcome).text;
         } catch (e) {
             error = e as AppError;

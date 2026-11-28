@@ -320,6 +320,74 @@ fn invalid_globs_are_reported() {
 }
 
 #[test]
+fn changelog_groups_default_to_the_conventional_list() {
+    for text in [TWO_REPO, SINGLE_REPO] {
+        let p = ProjFile::parse(text).unwrap();
+        assert_eq!(
+            p.release.changelog_groups,
+            vec![
+                "feat", "fix", "perf", "docs", "refactor", "test", "build", "ci", "chore"
+            ],
+            "default group list differs for {text:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_names_are_validated() {
+    // The remote is passed to `git` as a bare argument (e.g. `git push <remote> <ref>`),
+    // so a leading `-` or whitespace must be refused: either could be parsed as an option
+    // and break the call or, worse, be interpreted as something else.
+    let private_dash = TWO_REPO.replace("remote = \"origin\"", "remote = \"-upload-pack=x\"");
+    let private_space = TWO_REPO.replace("remote = \"origin\"", "remote = \"upstream main\"");
+    assert!(has_issue(&private_dash, "workflow.private.remote"));
+    assert!(has_issue(&private_space, "workflow.private.remote"));
+
+    // A clean name is accepted.
+    assert!(ProjFile::parse(TWO_REPO).is_ok());
+
+    // The public side is checked the same way (the default "origin" is fine).
+    let public_dash = TWO_REPO.replace(
+        "[workflow.public]\npath",
+        "[workflow.public]\nremote = \"-bad\"\npath",
+    );
+    let keys: Vec<String> = issues(&public_dash).into_iter().map(|i| i.key).collect();
+    assert!(
+        keys.contains(&"workflow.public.remote".to_string()),
+        "{keys:?}"
+    );
+}
+
+#[test]
+fn changelog_groups_are_validated() {
+    let text = TWO_REPO.replace(
+        "[release]\nversion_files",
+        "[release]\nchangelog_groups = [\"feat\", \"FEAT\", \"Bad Prefix!\", \"\", \"perf\"]\nversion_files",
+    );
+    let keys: Vec<String> = issues(&text).into_iter().map(|i| i.key).collect();
+    assert!(
+        keys.contains(&"release.changelog_groups[1]".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&"release.changelog_groups[2]".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&"release.changelog_groups[3]".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        !keys.contains(&"release.changelog_groups[0]".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        !keys.contains(&"release.changelog_groups[4]".to_string()),
+        "{keys:?}"
+    );
+}
+
+#[test]
 fn duplicate_targets_are_reported() {
     let text = format!("{TWO_REPO}\n[[release.targets]]\nkind = \"github\"\n");
     assert!(has_issue(&text, "release.targets[1].kind"));
@@ -357,6 +425,47 @@ fn find_proj_file_cases() {
         find_proj_file(dir.path()),
         Err(ProjError::Ambiguous { .. })
     ));
+}
+
+#[test]
+fn public_root_resolves_by_mode() {
+    let root = Path::new("/projects/example");
+
+    let two = ProjFile::parse(TWO_REPO).unwrap();
+    assert_eq!(
+        public_root(root, &two).unwrap(),
+        root.join("../ExampleMod-public")
+    );
+
+    // Single-repo has no separate public repo: the public side is `root` itself.
+    let single = ProjFile::parse(SINGLE_REPO).unwrap();
+    assert_eq!(public_root(root, &single).unwrap(), root.to_path_buf());
+}
+
+/// `private_root` mirrors `public_root`: the legacy layout (proj in the private repo,
+/// `path = "."`) resolves to `root` itself, and the new layout (proj at the project root,
+/// `path = "./private"`) resolves into the child `private/` repo.
+#[test]
+fn private_root_resolves_both_layouts() {
+    let root = Path::new("/projects/example");
+
+    // Legacy layout: the proj lives in the private repo itself.
+    let legacy = ProjFile::parse(TWO_REPO).unwrap();
+    assert_eq!(private_root(root, &legacy).unwrap(), root.to_path_buf());
+
+    // New layout: the proj lives at the project root, the private repo is beside public/.
+    let new_text = TWO_REPO.replace("path = \".\"", "path = \"./private\"");
+    let new = ProjFile::parse(&new_text).unwrap();
+    assert_eq!(private_root(root, &new).unwrap(), root.join("private"));
+
+    // Single-repo has no separate private repo: it is the root itself.
+    let single = ProjFile::parse(SINGLE_REPO).unwrap();
+    assert_eq!(private_root(root, &single).unwrap(), root.to_path_buf());
+
+    // A two-repo side with no path resolves to the root (the default `"."`), never an error.
+    let no_path =
+        ProjFile::parse(&new_text.replace("path = \"./private\"", "# path omitted")).unwrap();
+    assert_eq!(private_root(root, &no_path).unwrap(), root.to_path_buf());
 }
 
 #[test]

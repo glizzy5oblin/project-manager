@@ -71,7 +71,7 @@ pub fn detect() -> Result<GitInstall, GitError> {
 }
 
 pub fn detect_program(program: PathBuf) -> Result<GitInstall, GitError> {
-    let output = Command::new(&program)
+    let output = crate::host_env::apply(&mut Command::new(&program))
         .arg("--version")
         .env("LC_ALL", "C")
         .output()

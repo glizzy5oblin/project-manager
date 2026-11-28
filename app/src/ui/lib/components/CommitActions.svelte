@@ -1,24 +1,40 @@
 <script lang="ts">
     // Write actions on the selected commit and the branches pointing at it: new branch here,
-    // reset the current branch here, and check out, merge, rename or delete a branch. All go
+    // reset the current branch here, cherry-pick or revert it, edit the branch's commits from it
+    // on, and check out, merge, rebase onto, rename or delete a branch. All go
     // through the action runner, so dangerous ones are confirmed and backed up first.
     import { actions, outcomeNotice } from "../actions.svelte";
+    import { api } from "../api";
     import type { Action } from "../bindings/Action";
+    import type { ActionOutcome } from "../bindings/ActionOutcome";
     import type { AppError } from "../bindings/AppError";
     import type { HeadState } from "../bindings/HeadState";
+    import type { RebaseRange } from "../bindings/RebaseRange";
     import type { RefLabel } from "../bindings/RefLabel";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { ResetMode } from "../bindings/ResetMode";
-    import { commitCommands, type NameForm } from "../commitMenu.svelte";
+    import {
+        commitCommands,
+        editBlocked,
+        pickBlocked,
+        rebaseBlocked,
+        revertBlocked,
+        type NameForm,
+    } from "../commitMenu.svelte";
     import { shortId } from "../history";
     import ErrorBox from "./ErrorBox.svelte";
+    import RebaseEditor from "./RebaseEditor.svelte";
 
     let {
         projectId,
+        side = "private",
         commit,
         refs,
         head,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project these actions run on. */
+        side?: RepoSide;
         commit: string;
         refs: RefLabel[];
         head: HeadState | null;
@@ -32,6 +48,8 @@
     let notice = $state("");
     // A notice that needs the user's attention (conflicts) is shown as a warning.
     let noticeWarn = $state(false);
+    /** The commits the editor is open on, or null when it is closed. */
+    let editing = $state<RebaseRange | null>(null);
 
     // A different commit closes an open form and clears old messages.
     $effect.pre(() => {
@@ -50,6 +68,7 @@
         commitCommands.request = null;
         if (req.command.type === "form") open(req.command.form);
         else if (req.command.type === "action") void act(req.command.action);
+        else if (req.command.type === "edit") void startEdit();
     });
 
     const busy = $derived(!!actions.busy[projectId]);
@@ -60,6 +79,11 @@
 
     /** A reset needs a commit to move and somewhere else to move it from. */
     const resetOk = $derived(!!head?.commit && !isHeadCommit);
+
+    const pickWhy = $derived(pickBlocked(commit, head));
+    const revertWhy = $derived(revertBlocked(head));
+    // A merge or a commit off the branch is refused, with the reason, when the editor opens.
+    const editWhy = $derived(editBlocked(null, head));
 
     /** Why a merge of this branch cannot be done here, or null when it can. */
     function mergeBlocked(r: RefLabel): string | null {
@@ -75,7 +99,7 @@
         error = null;
         notice = "";
         try {
-            const outcome = await actions.run(projectId, action);
+            const outcome = await actions.run(projectId, action, false, side);
             if (!outcome) return false;
             ({ text: notice, warn: noticeWarn } = outcomeNotice(outcome));
             return true;
@@ -83,6 +107,22 @@
             error = e as AppError;
             return false;
         }
+    }
+
+    /** Open the commit editor on the branch's commits from this one on. */
+    async function startEdit() {
+        error = null;
+        notice = "";
+        try {
+            editing = await api.rebaseRange(projectId, commit, side);
+        } catch (e) {
+            error = e as AppError;
+        }
+    }
+
+    function edited(outcome: ActionOutcome) {
+        editing = null;
+        ({ text: notice, warn: noticeWarn } = outcomeNotice(outcome));
     }
 
     function open(f: NameForm) {
@@ -155,6 +195,35 @@
             </select>
         </span>
     </div>
+    <div class="row">
+        <button
+            type="button"
+            disabled={busy || pickWhy !== null}
+            title={pickWhy ??
+                `Copy this commit's change onto ${current ?? "the detached HEAD"} as a new commit`}
+            onclick={() => act({ type: "cherryPick", commit })}
+        >
+            Cherry-pick onto {current ?? "HEAD"}
+        </button>
+        <button
+            type="button"
+            disabled={busy || revertWhy !== null}
+            title={revertWhy ??
+                "Add a new commit that undoes this commit's change. History is kept"}
+            onclick={() => act({ type: "revert", commit })}
+        >
+            Revert
+        </button>
+        <button
+            type="button"
+            disabled={busy || editWhy !== null}
+            title={editWhy ??
+                `Reorder, squash, drop or reword the commits of ${current} from this one on`}
+            onclick={startEdit}
+        >
+            Edit commits from here…
+        </button>
+    </div>
 
     {#each branches as b (b.full)}
         {@const mergeWhy = mergeBlocked(b)}
@@ -180,6 +249,16 @@
                 onclick={() => act({ type: "merge", branch: b.name })}
             >
                 Merge into {current ?? "HEAD"}
+            </button>
+            <button
+                type="button"
+                class="merge"
+                title={rebaseBlocked(b, commit, head) ??
+                    `Move ${current}'s own commits so they start from ${b.name}. They get new ids; a backup is taken first`}
+                disabled={busy || rebaseBlocked(b, commit, head) !== null}
+                onclick={() => act({ type: "rebase", onto: b.name })}
+            >
+                Rebase {current ?? "HEAD"} onto
             </button>
             <button
                 title="Give this branch another name"
@@ -213,6 +292,16 @@
                 onclick={() => act({ type: "merge", branch: r.name })}
             >
                 Merge into {current ?? "HEAD"}
+            </button>
+            <button
+                type="button"
+                class="merge"
+                title={rebaseBlocked(r, commit, head) ??
+                    `Move ${current}'s own commits so they start from ${r.name}. They get new ids; a backup is taken first`}
+                disabled={busy || rebaseBlocked(r, commit, head) !== null}
+                onclick={() => act({ type: "rebase", onto: r.name })}
+            >
+                Rebase {current ?? "HEAD"} onto
             </button>
         </div>
     {/each}
@@ -270,6 +359,16 @@
         <p class="notice" class:warn={noticeWarn} role="status">{notice}</p>
     {/if}
 </section>
+
+{#if editing}
+    <RebaseEditor
+        {projectId}
+        {side}
+        range={editing}
+        onclose={() => (editing = null)}
+        ondone={edited}
+    />
+{/if}
 
 <style>
     .acts {

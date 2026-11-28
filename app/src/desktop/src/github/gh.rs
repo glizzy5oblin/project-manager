@@ -54,6 +54,7 @@ impl GhCli {
     /// Run `gh` without a shell, prompts, colours or update checks, killed after [`TIMEOUT`].
     fn run(&self, args: &[&str]) -> std::io::Result<Output> {
         let mut cmd = Command::new(&self.program);
+        crate::host_env::apply(&mut cmd);
         cmd.args(args)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")

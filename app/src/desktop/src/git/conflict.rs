@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Serialize;
 use ts_rs::TS;
 
+use super::state::Operation;
 use super::{GitCommand, GitError};
 
 /// Largest file whose markers are read, in bytes.
@@ -17,8 +18,9 @@ const MAX_LINES: usize = 40;
 /// Disagreements listed for one file.
 const MAX_REGIONS: usize = 50;
 
-/// How the two sides disagree about the file. "Ours" is the branch you are on, "theirs" the one
-/// being merged in.
+/// How the two sides disagree about the file. "Us" is your side (the branch you are on, or the
+/// commits of yours being replayed during a rebase), "them" the other side. See
+/// [`ConflictInfo::swapped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -64,11 +66,20 @@ pub struct ConflictRegion {
 pub struct ConflictInfo {
     pub path: String,
     pub kind: ConflictKind,
-    /// The branch you are on, or `None` when HEAD is detached.
+    /// Your side: the branch you are on (during a rebase, the branch being rebased), or `None`
+    /// when it has no name.
     pub ours_name: Option<String>,
-    /// The branch being merged in; a short commit id when it has no branch; `None` outside a
-    /// merge (rebase, cherry-pick, stash apply).
+    /// The other side: the branch being merged in, the commit being copied or undone, or the
+    /// branch being rebased onto ("the commits before it" when a branch's own commits are being
+    /// edited). A short commit id when it has no branch; `None` when unknown (a stash apply).
     pub theirs_name: Option<String>,
+    /// The operation that stopped on this conflict, if git still has one in progress.
+    pub during: Option<Operation>,
+    /// During a rebase git calls the branch being rebased onto "ours" and your commit "theirs".
+    /// Everything here is already turned round so that `ours` is always your side: the kind,
+    /// the names and each region's lines. The file's own markers keep git's order, so a
+    /// choice made on the text must be turned round too when this is set.
+    pub swapped: bool,
     /// The file is not text, so there are no regions to show.
     pub binary: bool,
     pub regions: Vec<ConflictRegion>,
@@ -120,28 +131,97 @@ fn kind_of([base, ours, theirs]: [bool; 3]) -> ConflictKind {
     }
 }
 
-/// The name of the branch being merged in, from `MERGE_HEAD`.
-fn merging_name(root: &Path) -> Option<String> {
-    let sha = git_text(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?;
-    let branches = git_text(
+/// A branch pointing at `sha` (local first), else its short id.
+fn name_of(root: &Path, sha: &str) -> String {
+    git_text(
         root,
         &[
             "for-each-ref",
             "--points-at",
-            &sha,
+            sha,
             "--format=%(refname:short)",
             "refs/heads",
             "refs/remotes",
         ],
     )
-    .unwrap_or_default();
-    Some(
-        branches
-            .lines()
-            .find(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-            .map(str::to_string)
-            .unwrap_or_else(|| sha.chars().take(8).collect()),
-    )
+    .unwrap_or_default()
+    .lines()
+    .find(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+    .map(str::to_string)
+    .unwrap_or_else(|| sha.chars().take(8).collect())
+}
+
+/// The operation in progress and the names of its two sides, your side first.
+fn sides(root: &Path) -> (Option<Operation>, Option<String>, Option<String>) {
+    let head_branch = git_text(root, &["symbolic-ref", "-q", "--short", "HEAD"]);
+    let git_dir =
+        git_text(root, &["rev-parse", "--absolute-git-dir"]).map(std::path::PathBuf::from);
+    let rebase_dir = git_dir.as_ref().and_then(|gd| {
+        [gd.join("rebase-merge"), gd.join("rebase-apply")]
+            .into_iter()
+            .find(|d| d.is_dir() && (d.ends_with("rebase-merge") || d.join("rebasing").exists()))
+    });
+    if let Some(dir) = rebase_dir {
+        let read = |f: &str| {
+            std::fs::read_to_string(dir.join(f))
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        };
+        let yours = read("head-name").map(|h| h.trim_start_matches("refs/heads/").to_string());
+        let onto = read("onto").map(|sha| {
+            // Rebased onto its own past (an interactive rebase editing the branch's commits):
+            // the other side is the commits already rewritten, not another branch.
+            let in_place = read("orig-head").is_some_and(|orig| {
+                GitCommand::new(root)
+                    .args(["merge-base", "--is-ancestor", &sha, &orig])
+                    .output()
+                    .is_ok_and(|o| o.success())
+            });
+            if in_place {
+                "the commits before it".to_string()
+            } else {
+                name_of(root, &sha)
+            }
+        });
+        return (Some(Operation::Rebase), yours, onto);
+    }
+    let commit = |name: &str| git_text(root, &["rev-parse", "-q", "--verify", name]);
+    if let Some(sha) = commit("MERGE_HEAD") {
+        return (
+            Some(Operation::Merge),
+            head_branch,
+            Some(name_of(root, &sha)),
+        );
+    }
+    let short = |sha: &str| sha.chars().take(8).collect::<String>();
+    if let Some(sha) = commit("CHERRY_PICK_HEAD") {
+        return (
+            Some(Operation::CherryPick),
+            head_branch,
+            Some(format!("commit {}", short(&sha))),
+        );
+    }
+    if let Some(sha) = commit("REVERT_HEAD") {
+        return (
+            Some(Operation::Revert),
+            head_branch,
+            Some(format!("the undo of {}", short(&sha))),
+        );
+    }
+    (None, head_branch, None)
+}
+
+/// Turn a kind round for a rebase, where git's "us" is the other side.
+fn swap_kind(kind: ConflictKind) -> ConflictKind {
+    use ConflictKind::*;
+    match kind {
+        DeletedByUs => DeletedByThem,
+        DeletedByThem => DeletedByUs,
+        AddedByUs => AddedByThem,
+        AddedByThem => AddedByUs,
+        k => k,
+    }
 }
 
 /// The disagreements marked in `text`. Understands both conflict styles (with and without the
@@ -219,14 +299,17 @@ pub fn parse_regions(text: &str) -> (Vec<ConflictRegion>, bool) {
 
 /// Describe the conflict in `path` (relative to the repository root).
 pub fn describe(root: &Path, path: &str) -> Result<ConflictInfo, GitError> {
+    let (during, ours_name, theirs_name) = sides(root);
+    let swapped = during == Some(Operation::Rebase);
     let kind = kind_of(stages(root, path)?);
-    let ours_name = git_text(root, &["symbolic-ref", "-q", "--short", "HEAD"]);
-    let theirs_name = merging_name(root);
+    let kind = if swapped { swap_kind(kind) } else { kind };
     let mut info = ConflictInfo {
         path: path.to_string(),
         kind,
         ours_name,
         theirs_name,
+        during,
+        swapped,
         binary: false,
         regions: Vec::new(),
         more_regions: false,
@@ -241,7 +324,12 @@ pub fn describe(root: &Path, path: &str) -> Result<ConflictInfo, GitError> {
                     info.binary = true;
                 } else {
                     let text = String::from_utf8_lossy(&bytes);
-                    let (regions, more) = parse_regions(&text);
+                    let (mut regions, more) = parse_regions(&text);
+                    if swapped {
+                        for r in &mut regions {
+                            std::mem::swap(&mut r.ours, &mut r.theirs);
+                        }
+                    }
                     info.regions = regions;
                     info.more_regions = more;
                     // Editing text that is not valid UTF-8 would damage it on save.

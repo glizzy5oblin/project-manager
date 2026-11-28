@@ -1,9 +1,11 @@
 <script lang="ts">
     // Browse the project's folders and edit text files. Nothing is written until Save; switching
     // away from unsaved edits asks first. The file's own text is shown as it is on disk.
+    import { untrack } from "svelte";
     import { api } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { FileEntry } from "../bindings/FileEntry";
+    import type { RepoSide } from "../bindings/RepoSide";
     import { findAll, lineOf, pickMatch } from "../fileSearch";
     import { highlight } from "../highlight";
     import { langForPath, type Token } from "../history";
@@ -11,10 +13,13 @@
 
     let {
         projectId,
+        side = "private",
         changed,
         path = $bindable(""),
     }: {
         projectId: string;
+        /** Which repository of a two-repo project to browse. */
+        side?: RepoSide;
         /** Bumped when the project's files change on disk. */
         changed: number;
         /** The open file; set from outside to open one. */
@@ -119,7 +124,7 @@
         if (!name || !creating) return;
         const dir = creating === "folder";
         try {
-            await api.fileCreate(projectId, name, dir);
+            await api.fileCreate(projectId, name, dir, side);
             creating = null;
             newName = "";
             error = null;
@@ -141,7 +146,7 @@
 
     async function loadDir(dir: string) {
         try {
-            const l = await api.filesList(projectId, dir);
+            const l = await api.filesList(projectId, dir, side);
             dirs[dir] = l.entries;
             truncated[dir] = l.truncated;
         } catch (e) {
@@ -152,7 +157,7 @@
     async function openFile(p: string) {
         const mine = ++request;
         try {
-            const f = await api.fileRead(projectId, p);
+            const f = await api.fileRead(projectId, p, side);
             if (mine !== request) return;
             shown = p;
             loaded = f.text ?? "";
@@ -188,7 +193,7 @@
         if (!dirty || saving) return;
         saving = true;
         try {
-            await api.fileWrite(projectId, shown, draft);
+            await api.fileWrite(projectId, shown, draft, side);
             loaded = draft;
             notice = "Saved.";
             error = null;
@@ -221,10 +226,28 @@
         }
     });
 
+    // Switching to the other repo of a two-repo project shows a different tree and files, so the
+    // browse state from the old side does not apply here; drop it and start fresh.
+    let seenSide = untrack(() => side);
+    $effect(() => {
+        if (side === seenSide) return;
+        seenSide = side;
+        dirs = {};
+        truncated = {};
+        expanded = {};
+        shown = "";
+        loaded = "";
+        draft = "";
+        why = null;
+        notice = "";
+        asking = null;
+    });
+
     // Reload the tree when files change on disk; the open file follows unless it has edits.
     $effect(() => {
         void changed;
         void projectId;
+        void side;
         void loadDir("");
         for (const d of Object.keys(expanded)) if (expanded[d]) void loadDir(d);
         if (shown && !dirty && !asking) void openFile(shown);
@@ -321,6 +344,11 @@
         {/each}
         {#if truncated[""]}
             <p class="muted pad">The list was cut short: too many entries.</p>
+        {/if}
+        {#if dirs[""] === undefined}
+            <p class="muted pad">Loading…</p>
+        {:else if !rows.length}
+            <p class="muted pad">This folder is empty.</p>
         {/if}
     </nav>
     <div class="editor">

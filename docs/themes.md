@@ -72,3 +72,29 @@ The other themes still load.
 
 Project Manager watches the themes folder. Saving, adding or deleting a file reloads the list, and the
 current theme updates in place without a restart.
+
+## Saving, importing and exporting
+
+The themes live in the app's themes folder and, as described above, reload in place. The
+preferences dialog (**Edit…** next to the theme picker) opens a theme editor for the current
+theme: every color is an editable field with a live swatch. Saving a user theme rewrites its
+file; saving a built-in theme gives it a new name and id and writes a user file for it.
+
+- **Save** (user theme): rewrites the file with only the colors that differ from the built-in
+  theme of the same scheme — the merged theme still shows every color.
+- **Save as new theme** (built-in): writes a new user file whose id is the slug of the name
+  (lowercased, hyphen-joined, 1–40 chars; `-` and `_` kept); the theme is selected and applied
+  immediately.
+- **Export…**: writes a complete file (every color, not only the diff) to a chosen path,
+  re-loadable with the normal loader.
+- **Import theme…** (preferences dialog): validates a chosen `.json` file with the same rules
+  as the loader and copies it into the themes folder; the new theme's id is the file name
+  (without `.json`), it is selected and applied immediately. Export is the only way to get a
+  theme into a different machine, import brings it back.
+- Import/export/save-as errors (an unknown color key, a bad color, an existing id, an
+  unreadable file) are reported in the dialog and change nothing.
+
+`theme_save_user` (id, colors), `theme_save_as` (name, scheme, colors) and
+`theme_import` (path) return the new theme id; `theme_export` takes (id, path). All four are
+registered in `lib.rs` and wrap `theme/mod.rs` (`save_user`, `save_as`, `import_theme`,
+`export_theme`).

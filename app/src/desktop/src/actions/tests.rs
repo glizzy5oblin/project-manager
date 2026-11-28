@@ -69,7 +69,7 @@ fn snapshot(r: &FixtureRepo) -> String {
         s.push_str(&git_out(r, args));
         s.push('\n');
     }
-    for f in ["MERGE_HEAD", "MERGE_MSG"] {
+    for f in ["MERGE_HEAD", "MERGE_MSG", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
         s.push_str(&format!(
             "{f}: {:?}\n",
             std::fs::read_to_string(r.path().join(".git").join(f)).ok()
@@ -129,6 +129,52 @@ fn assert_undoable(r: &FixtureRepo, action: Action) -> ActionOutcome {
         .unwrap();
     assert_eq!(snapshot(r), before, "restoring after {action:?}");
     out
+}
+
+#[test]
+fn backups_are_optional_and_confirmation_still_gates_the_run() {
+    // With backups off a dangerous action runs with a token but records no backup.
+    let r = linear(3);
+    make_dirty(&r);
+    let action = Action::Discard {
+        paths: vec!["file.txt".into()],
+    };
+    let p = preview(&repo(&r), &action, false).unwrap();
+    let out = run(
+        &repo(&r),
+        &action,
+        Some(&p.token),
+        &RunOptions {
+            backups: false,
+            ..Default::default()
+        },
+        &OpLog::new(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(out.backup.is_none(), "backups are off: {out:?}");
+
+    // ... and without a token the confirmation gate still refuses the run.
+    let r = linear(3);
+    make_dirty(&r);
+    let action = Action::Discard {
+        paths: vec!["file.txt".into()],
+    };
+    let e = run(
+        &repo(&r),
+        &action,
+        None,
+        &RunOptions {
+            backups: false,
+            ..Default::default()
+        },
+        &OpLog::new(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -203,6 +249,896 @@ fn every_dangerous_action_takes_a_backup_that_undoes_it() {
     assert_undoable(&r, Action::AbortMerge);
     let s = crate::git::state::read_state(r.path(), false).unwrap();
     assert_eq!(s.in_progress, Some(crate::git::state::Operation::Merge));
+
+    // Rebase, finished cleanly and stopped on a conflict, with an untracked file present
+    // (rebase refuses tracked changes).
+    let r = diverged();
+    r.write("untracked.txt", "x\n");
+    let out = assert_undoable(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(out.conflicts.is_empty());
+    let r = conflict();
+    r.checkout("topic");
+    r.write("untracked.txt", "x\n");
+    let out = assert_undoable(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert_eq!(out.conflicts, vec!["conflict.txt".to_string()]);
+
+    // Interactive rebase, finished cleanly (reorder, squash, drop, reword) and stopped on a
+    // conflict, with an untracked file present.
+    let r = stack();
+    r.write("untracked.txt", "x\n");
+    let action = edit(
+        &r,
+        Some("HEAD~4"),
+        vec![
+            todo_item(&r, "HEAD", TodoOp::Pick),
+            reworded(&r, "HEAD~3", "A"),
+            todo_item(&r, "HEAD~2", TodoOp::Squash),
+            todo_item(&r, "HEAD~1", TodoOp::Drop),
+        ],
+    );
+    let out = assert_undoable(&r, action);
+    assert!(out.conflicts.is_empty());
+    let r = clashing();
+    r.write("untracked.txt", "x\n");
+    let action = edit(
+        &r,
+        Some("HEAD~3"),
+        vec![
+            todo_item(&r, "HEAD", TodoOp::Pick),
+            todo_item(&r, "HEAD~2", TodoOp::Pick),
+            todo_item(&r, "HEAD~1", TodoOp::Pick),
+        ],
+    );
+    let out = assert_undoable(&r, action);
+    assert_eq!(out.conflicts, vec!["f.txt".to_string()]);
+
+    // Abort a cherry-pick and a revert stopped on a conflict, one file settled by hand.
+    let r = conflict();
+    let _ = r.command(r.path(), &["cherry-pick", "topic"]).output();
+    r.write("conflict.txt", "resolved by hand\n");
+    r.write("untracked.txt", "x\n");
+    assert_undoable(&r, Action::AbortCherryPick);
+    let s = crate::git::state::read_state(r.path(), false).unwrap();
+    assert_eq!(
+        s.in_progress,
+        Some(crate::git::state::Operation::CherryPick)
+    );
+
+    let r = linear(3);
+    start_revert_conflict(&r);
+    r.write("untracked.txt", "x\n");
+    assert_undoable(&r, Action::AbortRevert);
+    let s = crate::git::state::read_state(r.path(), false).unwrap();
+    assert_eq!(s.in_progress, Some(crate::git::state::Operation::Revert));
+
+    // Pull with rebase: the branch's own commits replayed on the upstream's.
+    let (r, _remote) = ahead_behind();
+    r.write("untracked.txt", "x\n");
+    assert_undoable(&r, Action::Pull { rebase: true });
+
+    // Force push changes nothing local; the backup keeps the commit it replaced on the
+    // remote, and restoring leaves the repository as it was.
+    let (r, remote) = ahead_behind();
+    make_dirty(&r);
+    let theirs = git_out(&r, &["rev-parse", "origin/main"]);
+    let before = snapshot(&r);
+    let out = ok(
+        &r,
+        Action::Push {
+            remote: None,
+            force: true,
+        },
+    );
+    let backup = out.backup.expect("a force push takes a backup");
+    assert_eq!(backup.action, "force-push");
+    assert_eq!(git_out(&remote, &["rev-parse", "main"]), r.head());
+    assert_eq!(
+        git_out(
+            &r,
+            &[
+                "rev-parse",
+                &format!("refs/pm/backups/{}/remotes/origin/main", backup.id)
+            ]
+        ),
+        theirs
+    );
+    assert!(backup.remotes.iter().any(|t| t.commit == theirs));
+    Backups::open(r.path())
+        .unwrap()
+        .restore(&backup.id, &Default::default())
+        .unwrap();
+    assert_eq!(snapshot(&r), before);
+    // Remote-tracking branches follow the remote, so a restore leaves them alone.
+    assert_eq!(git_out(&r, &["rev-parse", "origin/main"]), r.head());
+}
+
+/// `main` and `side` each with a commit of their own touching different files.
+fn diverged() -> FixtureRepo {
+    let r = linear(2);
+    r.checkout_new("side");
+    r.commit_file("side.txt", "side\n", "side work");
+    r.commit_file("side2.txt", "side 2\n", "more side work");
+    r.checkout("main");
+    r.commit_file("main.txt", "main\n", "main work");
+    r.checkout("side");
+    r
+}
+
+/// In a [`linear`] repo of 3 or more commits, revert `HEAD~1`, which conflicts with HEAD.
+fn start_revert_conflict(r: &FixtureRepo) {
+    let out = r
+        .command(r.path(), &["revert", "--no-edit", "HEAD~1"])
+        .output()
+        .unwrap();
+    assert!(!out.success(), "revert was expected to conflict");
+}
+
+/// A rebase of `topic` onto `main` in a [`conflict`] repo, stopped on its conflict.
+fn start_rebase_conflict(r: &FixtureRepo) {
+    r.checkout("topic");
+    let out = r.command(r.path(), &["rebase", "main"]).output().unwrap();
+    assert!(!out.success(), "rebase was expected to conflict");
+}
+
+#[test]
+fn cherry_pick_revert_and_rebase_run_clean_and_stop_on_conflicts() {
+    // A clean cherry-pick adds one commit with the same message.
+    let r = diverged();
+    r.checkout("main");
+    let p = preview(
+        &repo(&r),
+        &Action::CherryPick {
+            commit: "side".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(!p.dangerous);
+    assert!(p.impact[0].contains("more side work"), "{:?}", p.impact);
+    let before = r.rev("HEAD");
+    let out = ok(
+        &r,
+        Action::CherryPick {
+            commit: "side".into(),
+        },
+    );
+    assert!(out.conflicts.is_empty());
+    assert_eq!(r.rev("HEAD~1"), before);
+    assert_eq!(r.git(&["log", "-1", "--format=%s"]), "more side work");
+    // Picking it again, or anything already on the branch, is refused.
+    let e = err(
+        &r,
+        Action::CherryPick {
+            commit: "main~1".into(),
+        },
+    );
+    assert!(e.message.contains("already part"), "{e:?}");
+
+    // A clean revert adds a commit that undoes it.
+    let out = ok(
+        &r,
+        Action::Revert {
+            commit: "HEAD".into(),
+        },
+    );
+    assert!(out.conflicts.is_empty());
+    assert!(!r.path().join("side2.txt").exists());
+    assert!(r.git(&["log", "-1", "--format=%s"]).starts_with("Revert"));
+    // A commit not on the branch cannot be reverted here.
+    r.checkout_new("elsewhere");
+    r.commit_file("else.txt", "x\n", "elsewhere");
+    r.checkout("main");
+    let e = err(
+        &r,
+        Action::Revert {
+            commit: "elsewhere".into(),
+        },
+    );
+    assert!(e.message.contains("not part"), "{e:?}");
+
+    // A conflicting cherry-pick stops; continue is refused until the file is settled, then
+    // commits it with the original message.
+    let r = conflict();
+    let out = ok(
+        &r,
+        Action::CherryPick {
+            commit: "topic".into(),
+        },
+    );
+    assert_eq!(out.conflicts, vec!["conflict.txt".to_string()]);
+    let e = err(
+        &r,
+        Action::Merge {
+            branch: "topic".into(),
+        },
+    );
+    assert!(e.message.contains("A cherry-pick is in progress"), "{e:?}");
+    let e = err(&r, Action::Continue);
+    assert!(e.message.contains("conflict"), "{e:?}");
+    let info = crate::git::conflict::describe(r.path(), "conflict.txt").unwrap();
+    assert!(!info.swapped);
+    assert_eq!(info.during, Some(crate::git::state::Operation::CherryPick));
+    assert_eq!(info.ours_name.as_deref(), Some("main"));
+    assert!(
+        info.theirs_name.as_deref().unwrap().starts_with("commit "),
+        "{info:?}"
+    );
+    assert_eq!(info.regions[0].ours, ["main version"]);
+    let e = err(&r, Action::AbortRevert);
+    assert!(e.message.contains("No revert"), "{e:?}");
+    ok(&r, resolve("conflict.txt", Keep::Theirs));
+    ok(&r, Action::Continue);
+    assert_eq!(r.git(&["log", "-1", "--format=%s"]), "topic edit");
+    assert_eq!(r.parents("HEAD").len(), 1);
+    assert_eq!(git_out(&r, &["status", "--porcelain"]), "");
+    let e = err(&r, Action::Continue);
+    assert!(e.message.contains("No cherry-pick"), "{e:?}");
+
+    // A conflicting revert stops and can be aborted, leaving nothing behind.
+    let r = linear(3);
+    let head = r.rev("HEAD");
+    let out = ok(
+        &r,
+        Action::Revert {
+            commit: "HEAD~1".into(),
+        },
+    );
+    assert_eq!(out.conflicts, vec!["file.txt".to_string()]);
+    ok(&r, Action::AbortRevert);
+    assert_eq!(r.rev("HEAD"), head);
+    assert_eq!(git_out(&r, &["status", "--porcelain"]), "");
+
+    // Reverting a merge undoes what it brought in.
+    let r = diverged();
+    r.checkout("main");
+    r.git(&["merge", "--no-edit", "-q", "side"]);
+    let p = preview(
+        &repo(&r),
+        &Action::Revert {
+            commit: "HEAD".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(
+        p.impact.join(" ").contains("It is a merge"),
+        "{:?}",
+        p.impact
+    );
+    ok(
+        &r,
+        Action::Revert {
+            commit: "HEAD".into(),
+        },
+    );
+    assert!(!r.path().join("side.txt").exists());
+    assert!(r.path().join("main.txt").exists());
+    // And a merge commit cannot be cherry-picked.
+    r.checkout_new("other");
+    r.git(&["reset", "-q", "--hard", "main~2"]);
+    let e = err(
+        &r,
+        Action::CherryPick {
+            commit: "main~1".into(),
+        },
+    );
+    assert!(e.message.contains("merge commit"), "{e:?}");
+}
+
+#[test]
+fn rebase_replays_the_branch_and_handles_conflicts() {
+    // Clean: side's two commits land on top of main.
+    let r = diverged();
+    let p = preview(
+        &repo(&r),
+        &Action::Rebase {
+            onto: "main".into(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(p.dangerous);
+    let text = p.impact.join(" ");
+    assert!(text.contains("Replays 2 commits of side"), "{text}");
+    let out = ok(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(out.backup.is_some());
+    assert_eq!(r.rev("side~2"), r.rev("main"));
+    assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]), "side");
+    // Rebasing again is refused: side already contains main.
+    let e = err(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(e.message.contains("already contains"), "{e:?}");
+
+    // Tracked changes are refused before anything runs.
+    let r = diverged();
+    r.write("file.txt", "edited\n");
+    let e = err(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(e.message.contains("commit or stash"), "{e:?}");
+    // So is a detached HEAD.
+    let r = diverged();
+    r.git(&["checkout", "-q", "--detach"]);
+    let e = err(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(e.message.contains("not on a branch"), "{e:?}");
+
+    // A conflict stops it; settle and continue finishes it on the branch.
+    let r = conflict();
+    r.checkout("topic");
+    let out = ok(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert_eq!(out.conflicts, vec!["conflict.txt".to_string()]);
+    let s = crate::git::state::read_state(r.path(), false).unwrap();
+    assert_eq!(s.in_progress, Some(crate::git::state::Operation::Rebase));
+    let e = err(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    assert!(e.message.contains("A rebase is in progress"), "{e:?}");
+    // During a rebase "mine" is topic's commit being replayed, though git calls it theirs.
+    let info = crate::git::conflict::describe(r.path(), "conflict.txt").unwrap();
+    assert!(info.swapped);
+    assert_eq!(info.ours_name.as_deref(), Some("topic"));
+    assert_eq!(info.theirs_name.as_deref(), Some("main"));
+    assert_eq!(info.regions[0].ours, ["topic version"]);
+    assert_eq!(info.regions[0].theirs, ["main version"]);
+    ok(&r, resolve("conflict.txt", Keep::Ours));
+    ok(&r, Action::Continue);
+    assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]), "topic");
+    assert_eq!(r.rev("topic~1"), r.rev("main"));
+    assert_eq!(r.read("conflict.txt"), "topic version\n");
+
+    // Settled to main's version, the commit has nothing left and is dropped.
+    let r = conflict();
+    r.checkout("topic");
+    ok(
+        &r,
+        Action::Rebase {
+            onto: "main".into(),
+        },
+    );
+    ok(&r, resolve("conflict.txt", Keep::Theirs));
+    ok(&r, Action::Continue);
+    assert_eq!(r.rev("topic"), r.rev("main"));
+
+    // Abort puts the branch back, and its backup keeps the files as they were.
+    let r = conflict();
+    let tip = r.rev("topic");
+    start_rebase_conflict(&r);
+    r.write("conflict.txt", "settled by hand\n");
+    let out = ok(&r, Action::AbortRebase);
+    assert_eq!(r.rev("topic"), tip);
+    assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]), "topic");
+    assert_eq!(git_out(&r, &["status", "--porcelain"]), "");
+    let backup = out.backup.expect("abort-rebase takes a backup");
+    let restored = Backups::open(r.path())
+        .unwrap()
+        .restore(&backup.id, &Default::default())
+        .unwrap();
+    assert!(restored.warnings.is_empty(), "{:?}", restored.warnings);
+    assert_eq!(r.read("conflict.txt"), "settled by hand\n");
+}
+
+/// `main` with a first commit and four more, each adding its own file, so any order applies
+/// cleanly.
+fn stack() -> FixtureRepo {
+    let r = FixtureRepo::new();
+    r.commit_file("base.txt", "base\n", "base");
+    for n in ["a", "b", "c", "d"] {
+        r.commit_file(&format!("{n}.txt"), &format!("{n}\n"), &format!("add {n}"));
+    }
+    r
+}
+
+/// `main` where `set one` and `set two` change the same line one after the other, so swapping
+/// them conflicts, with `add g` (another file) between them.
+fn clashing() -> FixtureRepo {
+    let r = FixtureRepo::new();
+    r.commit_file("f.txt", "zero\n", "base");
+    r.commit_file("f.txt", "one\n", "set one");
+    r.commit_file("g.txt", "g\n", "add g");
+    r.commit_file("f.txt", "two\n", "set two");
+    r
+}
+
+fn todo_item(r: &FixtureRepo, rev: &str, op: TodoOp) -> TodoItem {
+    TodoItem {
+        commit: r.rev(rev),
+        op,
+        message: None,
+    }
+}
+
+fn reworded(r: &FixtureRepo, rev: &str, message: &str) -> TodoItem {
+    TodoItem {
+        message: Some(message.into()),
+        ..todo_item(r, rev, TodoOp::Pick)
+    }
+}
+
+fn edit(r: &FixtureRepo, base: Option<&str>, todo: Vec<TodoItem>) -> Action {
+    Action::RebaseInteractive {
+        base: base.map(|b| r.rev(b)),
+        todo,
+    }
+}
+
+/// The subjects of the current branch, oldest first.
+fn subjects(r: &FixtureRepo) -> Vec<String> {
+    git_out(r, &["log", "--reverse", "--format=%s"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn rebase_range_lists_the_commits_to_edit() {
+    let r = stack();
+    let range = rebase_range(&repo(&r), "HEAD~3").unwrap();
+    assert_eq!(range.branch, "main");
+    assert_eq!(range.base, Some(r.rev("HEAD~4")));
+    let listed: Vec<&str> = range.commits.iter().map(|c| c.subject.as_str()).collect();
+    assert_eq!(listed, ["add a", "add b", "add c", "add d"]);
+    let a = &range.commits[0];
+    assert_eq!(a.id, r.rev("HEAD~3"));
+    assert_eq!(a.short_id, git_out(&r, &["rev-parse", "--short", "HEAD~3"]));
+    assert_eq!(a.message, "add a\n");
+    assert!(!a.author.is_empty());
+    assert!(range.commits.iter().all(|c| !c.pushed));
+
+    // From the first commit: no base, every commit.
+    let range = rebase_range(&repo(&r), "HEAD~4").unwrap();
+    assert_eq!(range.base, None);
+    assert_eq!(range.commits.len(), 5);
+
+    // Commits a remote-tracking branch has are marked; the whole message is given.
+    r.git(&["update-ref", "refs/remotes/origin/main", "HEAD~2"]);
+    r.commit_file("e.txt", "e\n", "add e\n\nwith a body\n#123 and this");
+    let range = rebase_range(&repo(&r), "HEAD~3").unwrap();
+    let pushed: Vec<bool> = range.commits.iter().map(|c| c.pushed).collect();
+    assert_eq!(pushed, [true, false, false, false]);
+    assert_eq!(
+        range.commits[3].message,
+        "add e\n\nwith a body\n#123 and this\n"
+    );
+
+    // Refused: a commit that is not on the branch, a merge, a detached HEAD, uncommitted
+    // changes, and an operation in progress.
+    let r = diverged();
+    let e = rebase_range(&repo(&r), "main").unwrap_err();
+    assert!(
+        e.message.contains("not part of the current branch"),
+        "{e:?}"
+    );
+    let r = merges();
+    r.checkout("main");
+    let e = rebase_range(&repo(&r), "HEAD").unwrap_err();
+    assert!(e.message.contains("That is a merge commit"), "{e:?}");
+    let e = rebase_range(&repo(&r), "HEAD~3").unwrap_err();
+    assert!(e.message.contains("is a merge commit"), "{e:?}");
+    let r = stack();
+    r.git(&["checkout", "-q", "--detach"]);
+    let e = rebase_range(&repo(&r), "HEAD~1").unwrap_err();
+    assert!(e.message.contains("not on a branch"), "{e:?}");
+    let r = stack();
+    r.write("a.txt", "edited\n");
+    let e = rebase_range(&repo(&r), "HEAD~1").unwrap_err();
+    assert!(e.message.contains("commit or stash"), "{e:?}");
+    let r = conflict();
+    start_rebase_conflict(&r);
+    let e = rebase_range(&repo(&r), "HEAD").unwrap_err();
+    assert!(e.message.contains("A rebase is in progress"), "{e:?}");
+}
+
+#[test]
+fn interactive_rebase_reorders_squashes_drops_and_rewords() {
+    use TodoOp::*;
+
+    // Reorder: the base keeps its id, the files are all there.
+    let r = stack();
+    let base = r.rev("HEAD~4");
+    let action = edit(
+        &r,
+        Some("HEAD~4"),
+        vec![
+            todo_item(&r, "HEAD~2", Pick),
+            todo_item(&r, "HEAD~3", Pick),
+            todo_item(&r, "HEAD~1", Pick),
+            todo_item(&r, "HEAD", Pick),
+        ],
+    );
+    let p = preview(&repo(&r), &action, false).unwrap();
+    assert!(p.dangerous);
+    assert_eq!(p.title, "Edit 4 commits of main");
+    let text = p.impact.join("\n");
+    assert!(text.contains("Puts the commits in the new order"), "{text}");
+    assert!(text.contains("4 commits get new ids"), "{text}");
+    let out = ok(&r, action);
+    assert!(out.backup.is_some());
+    assert!(out.conflicts.is_empty());
+    assert_eq!(subjects(&r), ["base", "add b", "add a", "add c", "add d"]);
+    assert_eq!(r.rev("HEAD~4"), base);
+    assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]), "main");
+    assert_eq!(git_out(&r, &["status", "--porcelain"]), "");
+    for f in ["a", "b", "c", "d"] {
+        assert_eq!(r.read(&format!("{f}.txt")), format!("{f}\n"));
+    }
+
+    // Reword one in the middle: its author, date and changes stay; the commits before it keep
+    // their ids. Lines starting with # are kept.
+    let r = stack();
+    let (a, b) = (r.rev("HEAD~3"), r.rev("HEAD~2"));
+    let action = edit(
+        &r,
+        Some("HEAD~4"),
+        vec![
+            todo_item(&r, "HEAD~3", Pick),
+            reworded(&r, "HEAD~2", "Add B  \n\n\nwith a body\n#123 kept\n\n"),
+            todo_item(&r, "HEAD~1", Pick),
+            todo_item(&r, "HEAD", Pick),
+        ],
+    );
+    let text = preview(&repo(&r), &action, false)
+        .unwrap()
+        .impact
+        .join("\n");
+    assert!(text.contains("Gives 1 commit a new message"), "{text}");
+    assert!(!text.contains("new order"), "{text}");
+    assert!(text.contains("3 commits get new ids"), "{text}");
+    ok(&r, action);
+    assert_eq!(r.rev("HEAD~3"), a);
+    assert_eq!(
+        git_out(&r, &["log", "-1", "--format=%B", "HEAD~2"]),
+        "Add B\n\nwith a body\n#123 kept"
+    );
+    let who = "--format=%an %ae %ad %cn %ce %cd %T";
+    assert_eq!(
+        git_out(&r, &["log", "-1", who, "HEAD~2"]),
+        git_out(&r, &["log", "-1", who, &b])
+    );
+    assert_eq!(subjects(&r), ["base", "add a", "Add B", "add c", "add d"]);
+
+    // Squash and fixup: one commit with both kept messages and all the changes.
+    let r = stack();
+    ok(
+        &r,
+        edit(
+            &r,
+            Some("HEAD~4"),
+            vec![
+                todo_item(&r, "HEAD~3", Pick),
+                todo_item(&r, "HEAD~2", Squash),
+                todo_item(&r, "HEAD~1", Fixup),
+                todo_item(&r, "HEAD", Pick),
+            ],
+        ),
+    );
+    assert_eq!(subjects(&r), ["base", "add a", "add d"]);
+    assert_eq!(
+        git_out(&r, &["log", "-1", "--format=%B", "HEAD~1"]),
+        "add a\n\nadd b"
+    );
+    assert_eq!(
+        git_out(&r, &["show", "--format=", "--name-only", "HEAD~1"]),
+        "a.txt\nb.txt\nc.txt"
+    );
+
+    // A message given on the first commit of a group is the group's whole message.
+    let r = stack();
+    ok(
+        &r,
+        edit(
+            &r,
+            Some("HEAD~2"),
+            vec![
+                reworded(&r, "HEAD~1", "c and d"),
+                todo_item(&r, "HEAD", Squash),
+            ],
+        ),
+    );
+    assert_eq!(subjects(&r), ["base", "add a", "add b", "c and d"]);
+    assert_eq!(git_out(&r, &["log", "-1", "--format=%B"]), "c and d");
+
+    // Drop: the commit and its file are gone; the backup is named in the impact.
+    let r = stack();
+    let action = edit(
+        &r,
+        Some("HEAD~4"),
+        vec![
+            todo_item(&r, "HEAD~3", Pick),
+            todo_item(&r, "HEAD~2", Drop),
+            todo_item(&r, "HEAD~1", Pick),
+            todo_item(&r, "HEAD", Pick),
+        ],
+    );
+    let text = preview(&repo(&r), &action, false)
+        .unwrap()
+        .impact
+        .join("\n");
+    assert!(text.contains("Leaves out 1 commit"), "{text}");
+    assert!(text.contains("the backup keeps it"), "{text}");
+    ok(&r, action);
+    assert_eq!(subjects(&r), ["base", "add a", "add c", "add d"]);
+    assert!(!r.path().join("b.txt").exists());
+
+    // Dropping only the last commit gives nothing a new id.
+    let r = stack();
+    let action = edit(
+        &r,
+        Some("HEAD~2"),
+        vec![todo_item(&r, "HEAD~1", Pick), todo_item(&r, "HEAD", Drop)],
+    );
+    let text = preview(&repo(&r), &action, false)
+        .unwrap()
+        .impact
+        .join("\n");
+    assert!(!text.contains("new ids"), "{text}");
+    let parent = r.rev("HEAD~1");
+    ok(&r, action);
+    assert_eq!(r.head(), parent);
+
+    // From the first commit, rewording it: the new first commit has no parent.
+    let r = stack();
+    let mut todo = vec![reworded(&r, "HEAD~4", "the beginning")];
+    for rev in ["HEAD~3", "HEAD~2", "HEAD~1", "HEAD"] {
+        todo.push(todo_item(&r, rev, Pick));
+    }
+    ok(&r, edit(&r, None, todo));
+    assert_eq!(
+        subjects(&r),
+        ["the beginning", "add a", "add b", "add c", "add d"]
+    );
+    assert!(r.parents("HEAD~4").is_empty());
+
+    // Everything at once, with the impact listing each kind of change and other branches.
+    let r = stack();
+    r.branch("keep-old");
+    r.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let action = edit(
+        &r,
+        Some("HEAD~4"),
+        vec![
+            todo_item(&r, "HEAD", Pick),
+            reworded(&r, "HEAD~3", "A"),
+            todo_item(&r, "HEAD~2", Squash),
+            todo_item(&r, "HEAD~1", Drop),
+        ],
+    );
+    let text = preview(&repo(&r), &action, false)
+        .unwrap()
+        .impact
+        .join("\n");
+    for want in [
+        "new order",
+        "new message",
+        "Folds 1 commit",
+        "Leaves out 1 commit",
+        "2 commits get new ids",
+        "already on origin/main",
+        "Other branches with these commits keep the old ones: keep-old",
+    ] {
+        assert!(text.contains(want), "{want:?} missing from {text}");
+    }
+    ok(&r, action);
+    assert_eq!(subjects(&r), ["base", "add d", "A"]);
+    assert_eq!(git_out(&r, &["log", "-1", "--format=%B"]), "A");
+    assert!(!r.path().join("c.txt").exists());
+    assert_eq!(r.read("b.txt"), "b\n");
+    assert_eq!(r.rev("keep-old~1"), r.rev("origin/main~1"));
+}
+
+#[test]
+fn interactive_rebase_refuses_lists_that_do_not_fit() {
+    use TodoOp::*;
+    let r = stack();
+    let head = r.head();
+    let full = |r: &FixtureRepo| -> Vec<TodoItem> {
+        ["HEAD~3", "HEAD~2", "HEAD~1", "HEAD"]
+            .iter()
+            .map(|rev| todo_item(r, rev, Pick))
+            .collect()
+    };
+    let refused = |todo: Vec<TodoItem>, want: &str| {
+        let e = err(&r, edit(&r, Some("HEAD~4"), todo));
+        assert!(e.message.contains(want), "{want:?}: {e:?}");
+        assert_eq!(r.head(), head);
+    };
+    refused(full(&r), "Nothing would change");
+    let mut same_message = full(&r);
+    same_message[1].message = Some("add b\n".into());
+    refused(same_message, "Nothing would change");
+    refused(full(&r)[1..].to_vec(), "is missing");
+    let mut twice = full(&r);
+    twice[0] = twice[1].clone();
+    refused(twice, "listed twice");
+    let mut other = full(&r);
+    other[0].commit = r.rev("HEAD~4");
+    refused(other, "not one of the commits being edited");
+    let mut fold_first = full(&r);
+    fold_first[0].op = Fixup;
+    refused(fold_first, "no kept commit before it");
+    let mut after_drop = full(&r);
+    after_drop[0].op = Drop;
+    after_drop[1].op = Squash;
+    refused(after_drop, "no kept commit before it");
+    let mut all_dropped = full(&r);
+    for i in &mut all_dropped {
+        i.op = Drop;
+    }
+    refused(all_dropped, "reset main");
+    let mut dropped_message = full(&r);
+    dropped_message[2].op = Drop;
+    dropped_message[2].message = Some("x".into());
+    refused(dropped_message, "cannot get a new message");
+    let mut empty = full(&r);
+    empty[2].message = Some(" \n ".into());
+    refused(empty, "is empty");
+    let mut nul = full(&r);
+    nul[2].message = Some("a\0b".into());
+    refused(nul, "NUL");
+
+    // The base must be on the branch and before HEAD, and the range free of merges.
+    let e = err(&r, edit(&r, Some("HEAD"), vec![]));
+    assert!(e.message.contains("no commits after"), "{e:?}");
+    let r = diverged();
+    let e = err(
+        &r,
+        edit(&r, Some("main"), vec![todo_item(&r, "HEAD", Drop)]),
+    );
+    assert!(e.message.contains("is not part of side"), "{e:?}");
+    let r = merges();
+    r.checkout("main");
+    let e = err(&r, edit(&r, Some("HEAD~3"), vec![]));
+    assert!(e.message.contains("is a merge commit"), "{e:?}");
+
+    // Every commit dropped from the first one would leave the branch empty.
+    let r = linear(2);
+    let e = err(
+        &r,
+        edit(
+            &r,
+            None,
+            vec![todo_item(&r, "HEAD~1", Drop), todo_item(&r, "HEAD", Drop)],
+        ),
+    );
+    assert!(e.message.contains("cannot be left empty"), "{e:?}");
+
+    // Tracked changes are refused; untracked files are fine.
+    let r = stack();
+    r.write("untracked.txt", "x\n");
+    r.write("a.txt", "edited\n");
+    let drop_last = |r: &FixtureRepo| {
+        edit(
+            r,
+            Some("HEAD~2"),
+            vec![todo_item(r, "HEAD~1", Pick), todo_item(r, "HEAD", Drop)],
+        )
+    };
+    let e = err(&r, drop_last(&r));
+    assert!(e.message.contains("commit or stash"), "{e:?}");
+    r.git(&["checkout", "--", "a.txt"]);
+    ok(&r, drop_last(&r));
+    assert_eq!(r.read("untracked.txt"), "x\n");
+}
+
+#[test]
+fn interactive_rebase_stops_on_conflicts_and_keeps_new_messages() {
+    use TodoOp::*;
+
+    // Swap the clashing commits, rewording the one that moves first. Both stop on a conflict;
+    // settling each and continuing finishes with the new message in place.
+    let r = clashing();
+    let out = ok(
+        &r,
+        edit(
+            &r,
+            Some("HEAD~3"),
+            vec![
+                reworded(&r, "HEAD", "two, first now\n\n#7 stays"),
+                todo_item(&r, "HEAD~2", Pick),
+                todo_item(&r, "HEAD~1", Pick),
+            ],
+        ),
+    );
+    assert_eq!(out.conflicts, vec!["f.txt".to_string()]);
+    let s = crate::git::state::read_state(r.path(), false).unwrap();
+    assert_eq!(s.in_progress, Some(crate::git::state::Operation::Rebase));
+    // "Mine" is the commit being replayed; the other side is the rewritten commits so far.
+    let info = crate::git::conflict::describe(r.path(), "f.txt").unwrap();
+    assert!(info.swapped);
+    assert_eq!(info.ours_name.as_deref(), Some("main"));
+    assert_eq!(info.theirs_name.as_deref(), Some("the commits before it"));
+    ok(&r, resolve("f.txt", Keep::Ours));
+    let out = ok(&r, Action::Continue);
+    assert_eq!(out.conflicts, vec!["f.txt".to_string()]);
+    ok(&r, resolve("f.txt", Keep::Ours));
+    ok(&r, Action::Continue);
+    let s = crate::git::state::read_state(r.path(), false).unwrap();
+    assert_eq!(s.in_progress, None);
+    assert_eq!(subjects(&r), ["base", "two, first now", "set one", "add g"]);
+    // git tidies a conflicted commit's message as it continues, dropping # lines.
+    assert_eq!(
+        git_out(&r, &["log", "-1", "--format=%B", "HEAD~2"]),
+        "two, first now"
+    );
+    assert_eq!(r.read("f.txt"), "one\n");
+
+    // A squashed commit that conflicts: the group still gets both messages, with none of
+    // git's own notes.
+    let r = clashing();
+    ok(
+        &r,
+        edit(
+            &r,
+            Some("HEAD~3"),
+            vec![
+                todo_item(&r, "HEAD~2", Drop),
+                todo_item(&r, "HEAD~1", Pick),
+                todo_item(&r, "HEAD", Squash),
+            ],
+        ),
+    );
+    ok(&r, resolve("f.txt", Keep::Ours));
+    ok(&r, Action::Continue);
+    assert_eq!(subjects(&r), ["base", "add g"]);
+    assert_eq!(
+        git_out(&r, &["log", "-1", "--format=%B"]),
+        "add g\n\nset two"
+    );
+    assert_eq!(r.read("f.txt"), "two\n");
+
+    // Abort puts the branch back as it was.
+    let r = clashing();
+    let tip = r.head();
+    ok(
+        &r,
+        edit(
+            &r,
+            Some("HEAD~3"),
+            vec![
+                todo_item(&r, "HEAD", Pick),
+                todo_item(&r, "HEAD~2", Pick),
+                todo_item(&r, "HEAD~1", Pick),
+            ],
+        ),
+    );
+    ok(&r, Action::AbortRebase);
+    assert_eq!(r.head(), tip);
+    assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]), "main");
+    assert_eq!(git_out(&r, &["status", "--porcelain"]), "");
 }
 
 #[test]
@@ -247,6 +1183,36 @@ fn a_failed_backup_stops_every_dangerous_action() {
             Action::AbortMerge,
         ),
         (
+            diverged(),
+            Action::Rebase {
+                onto: "main".into(),
+            },
+        ),
+        (
+            {
+                let r = conflict();
+                let _ = r.command(r.path(), &["cherry-pick", "topic"]).output();
+                r
+            },
+            Action::AbortCherryPick,
+        ),
+        (
+            {
+                let r = linear(3);
+                start_revert_conflict(&r);
+                r
+            },
+            Action::AbortRevert,
+        ),
+        (
+            {
+                let r = conflict();
+                start_rebase_conflict(&r);
+                r
+            },
+            Action::AbortRebase,
+        ),
+        (
             {
                 let r = linear(2);
                 r.write("stashed.txt", "x\n");
@@ -269,13 +1235,44 @@ fn a_failed_backup_stops_every_dangerous_action() {
             Action::StashClear,
         ),
     ];
+    let (pulled, _pull_remote) = ahead_behind();
+    let (forced, force_remote) = ahead_behind();
+    let remote_main = git_out(&force_remote, &["rev-parse", "main"]);
+    let edited = stack();
+    let edit_action = edit(
+        &edited,
+        Some("HEAD~2"),
+        vec![
+            todo_item(&edited, "HEAD", TodoOp::Pick),
+            todo_item(&edited, "HEAD~1", TodoOp::Pick),
+        ],
+    );
+    let cases = cases.into_iter().chain([
+        (edited, edit_action),
+        (pulled, Action::Pull { rebase: true }),
+        (
+            forced,
+            Action::Push {
+                remote: None,
+                force: true,
+            },
+        ),
+    ]);
     for (r, mut action) in cases {
         if let Action::StashDrop { stash } = &mut action {
             *stash = git_out(&r, &["rev-parse", "stash@{0}"]);
         }
         if !matches!(
             action,
-            Action::AbortMerge | Action::StashDrop { .. } | Action::StashClear
+            Action::AbortMerge
+                | Action::AbortCherryPick
+                | Action::AbortRevert
+                | Action::AbortRebase
+                | Action::Rebase { .. }
+                | Action::RebaseInteractive { .. }
+                | Action::StashDrop { .. }
+                | Action::StashClear
+                | Action::Pull { .. }
         ) {
             r.write("file.txt", "unstaged edit\n");
         }
@@ -292,6 +1289,8 @@ fn a_failed_backup_stops_every_dangerous_action() {
         assert_eq!(entries[0].kind, OpKind::Backup);
         assert!(!entries[0].ok);
     }
+    // A push changes the remote, which the local snapshot does not show.
+    assert_eq!(git_out(&force_remote, &["rev-parse", "main"]), remote_main);
 }
 
 #[test]
@@ -927,6 +1926,38 @@ fn every_action_has_a_valid_backup_name() {
             stash: String::new(),
         },
         Action::StashClear,
+        Action::CherryPick {
+            commit: String::new(),
+        },
+        Action::Revert {
+            commit: String::new(),
+        },
+        Action::Rebase {
+            onto: String::new(),
+        },
+        Action::RebaseInteractive {
+            base: None,
+            todo: vec![],
+        },
+        Action::AbortCherryPick,
+        Action::AbortRevert,
+        Action::AbortRebase,
+        Action::Continue,
+        Action::Fetch { remote: None },
+        Action::Pull { rebase: false },
+        Action::Pull { rebase: true },
+        Action::Push {
+            remote: None,
+            force: false,
+        },
+        Action::Push {
+            remote: None,
+            force: true,
+        },
+        Action::PushTag {
+            tag: String::new(),
+            remote: String::new(),
+        },
     ];
     let dangerous: Vec<&str> = all.iter().filter_map(Action::danger).collect();
     assert_eq!(
@@ -940,7 +1971,14 @@ fn every_action_has_a_valid_backup_name() {
             "reset-mixed",
             "reset-hard",
             "stash-drop",
-            "stash-clear"
+            "stash-clear",
+            "rebase",
+            "rebase-interactive",
+            "abort-cherry-pick",
+            "abort-revert",
+            "abort-rebase",
+            "pull-rebase",
+            "force-push"
         ]
     );
     let r = linear(1);
@@ -1786,4 +2824,196 @@ fn ignoring_adds_a_line_to_gitignore_once() {
         .message
         .contains("start with")
     );
+}
+
+#[test]
+fn fetch_pull_and_push_with_a_remote() {
+    let e = err(&linear(1), Action::Fetch { remote: None });
+    assert!(e.message.contains("no remote"), "{e:?}");
+
+    let (r, remote) = ahead_behind();
+    let e = err(
+        &r,
+        Action::Fetch {
+            remote: Some("nope".into()),
+        },
+    );
+    assert!(e.message.contains("no remote \"nope\""), "{e:?}");
+    // Behind the remote: a plain push is refused before git runs.
+    let push = Action::Push {
+        remote: None,
+        force: false,
+    };
+    let e = err(&r, push.clone());
+    assert!(e.message.contains("pull first"), "{e:?}");
+    // The force push dialog says what is replaced, and that this is the main branch.
+    let p = preview(
+        &repo(&r),
+        &Action::Push {
+            remote: None,
+            force: true,
+        },
+        false,
+    )
+    .unwrap();
+    assert!(p.dangerous);
+    assert!(
+        p.impact[0].starts_with("Replaces main on origin: 1 commit"),
+        "{:?}",
+        p.impact
+    );
+    assert!(
+        p.impact.iter().any(|l| l.contains("main branch")),
+        "{:?}",
+        p.impact
+    );
+    assert!(
+        p.commands[0].contains("--force-with-lease=refs/heads/main:"),
+        "{:?}",
+        p.commands
+    );
+
+    ok(&r, Action::Fetch { remote: None });
+    ok(
+        &r,
+        Action::Fetch {
+            remote: Some("origin".into()),
+        },
+    );
+    let p = preview(&repo(&r), &Action::Pull { rebase: false }, false).unwrap();
+    assert!(!p.dangerous);
+    assert!(
+        p.impact
+            .iter()
+            .any(|l| l.contains("1 commit is to come in and main has 2 commits")),
+        "{:?}",
+        p.impact
+    );
+    let out = ok(&r, Action::Pull { rebase: false });
+    assert!(out.conflicts.is_empty());
+    assert_eq!(
+        r.commit_count("HEAD"),
+        6,
+        "two of each side, the base and a merge"
+    );
+    ok(&r, push.clone());
+    assert_eq!(git_out(&remote, &["rev-parse", "main"]), r.head());
+    let e = err(&r, push.clone());
+    assert!(e.message.starts_with("Nothing to push"), "{e:?}");
+    let e = err(
+        &r,
+        Action::Push {
+            remote: None,
+            force: true,
+        },
+    );
+    assert!(e.message.contains("normal Push is enough"), "{e:?}");
+
+    // A new branch goes to the only remote and tracks it from then on.
+    r.checkout_new("feat");
+    let e = err(&r, Action::Pull { rebase: false });
+    assert!(e.message.contains("no upstream"), "{e:?}");
+    r.commit_file("feat.txt", "f\n", "feature");
+    let p = preview(&repo(&r), &push, false).unwrap();
+    assert!(
+        p.impact[0].starts_with("Creates feat on origin"),
+        "{:?}",
+        p.impact
+    );
+    assert!(p.impact.iter().any(|l| l == "feat then tracks origin/feat"));
+    ok(&r, push.clone());
+    assert_eq!(git_out(&remote, &["rev-parse", "feat"]), r.head());
+    assert_eq!(
+        git_out(&r, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
+        "origin/feat"
+    );
+    let e = err(
+        &r,
+        Action::Push {
+            remote: Some("elsewhere".into()),
+            force: false,
+        },
+    );
+    assert!(e.message.contains("no remote"), "{e:?}");
+
+    // Tags.
+    r.tag("v1", Some("first"));
+    ok(
+        &r,
+        Action::PushTag {
+            tag: "v1".into(),
+            remote: "origin".into(),
+        },
+    );
+    assert_eq!(
+        git_out(&remote, &["rev-parse", "v1"]),
+        git_out(&r, &["rev-parse", "v1"])
+    );
+    let e = err(
+        &r,
+        Action::PushTag {
+            tag: "v2".into(),
+            remote: "origin".into(),
+        },
+    );
+    assert!(e.message.contains("no tag"), "{e:?}");
+
+    // Detached HEAD: nothing to push or pull.
+    r.git(&["checkout", "-q", "--detach"]);
+    let e = err(&r, push);
+    assert!(e.message.contains("not on a branch"), "{e:?}");
+}
+
+#[test]
+fn a_force_push_is_leased_on_what_the_preview_saw() {
+    let (r, remote) = ahead_behind();
+    let url = remote.path().to_str().unwrap().to_string();
+    let force = Action::Push {
+        remote: None,
+        force: true,
+    };
+    let p = preview(&repo(&r), &force, false).unwrap();
+
+    // Someone else pushes after the preview; this repository has not fetched it.
+    let other = FixtureRepo::new();
+    other.git(&["fetch", "-q", &url, "main"]);
+    other.git(&["reset", "-q", "--hard", "FETCH_HEAD"]);
+    other.commit_file("late.txt", "late\n", "late work");
+    other.git(&["push", "-q", &url, "HEAD:main"]);
+    let late = other.head();
+
+    let e = run_logged(&r, &force, Some(&p.token), &OpLog::new()).unwrap_err();
+    assert!(e.message.contains("changed since your last fetch"), "{e:?}");
+    assert!(e.detail.unwrap().contains("(stale info)"));
+    assert_eq!(
+        git_out(&remote, &["rev-parse", "main"]),
+        late,
+        "the late work is kept"
+    );
+
+    // After a fetch the new preview names it, and the push goes through.
+    ok(&r, Action::Fetch { remote: None });
+    let p = preview(&repo(&r), &force, false).unwrap();
+    assert!(p.impact[0].contains("2 commits"), "{:?}", p.impact);
+    ok(&r, force);
+    assert_eq!(git_out(&remote, &["rev-parse", "main"]), r.head());
+}
+
+#[test]
+fn a_conflicting_pull_stops_mid_merge() {
+    let (r, _remote) = ahead_behind();
+    // The remote added other.txt; add a different one here.
+    r.commit_file("other.txt", "mine\n", "my other");
+    let out = ok(&r, Action::Pull { rebase: false });
+    assert_eq!(out.conflicts, vec!["other.txt".to_string()]);
+    let e = err(&r, Action::Pull { rebase: false });
+    assert!(e.message.contains("merge is in progress"), "{e:?}");
+    ok(&r, Action::AbortMerge);
+
+    // With rebase, it stops on the commit that conflicts, and Abort puts main back.
+    let head = r.head();
+    let out = ok(&r, Action::Pull { rebase: true });
+    assert_eq!(out.conflicts, vec!["other.txt".to_string()]);
+    ok(&r, Action::AbortRebase);
+    assert_eq!(r.head(), head);
 }

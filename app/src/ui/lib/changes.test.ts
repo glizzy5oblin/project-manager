@@ -4,6 +4,7 @@ import {
     commitProblem,
     followSelection,
     kindLetter,
+    replayControls,
 } from "./changes";
 
 const status = {
@@ -73,5 +74,24 @@ describe("kindLetter", () => {
     it("gives one letter per kind", () => {
         expect(kindLetter("untracked")).toBe("U");
         expect(kindLetter("conflicted")).toBe("!");
+    });
+});
+
+describe("replayControls", () => {
+    it("offers Continue and the matching Abort for a cherry-pick, revert or rebase", () => {
+        expect(replayControls("cherryPick")?.abort).toEqual({
+            type: "abortCherryPick",
+        });
+        expect(replayControls("revert")?.abort).toEqual({
+            type: "abortRevert",
+        });
+        expect(replayControls("rebase")?.abort).toEqual({
+            type: "abortRebase",
+        });
+    });
+
+    it("leaves merges and everything else alone", () => {
+        for (const op of ["merge", "bisect", "applyMailbox", null] as const)
+            expect(replayControls(op)).toBeNull();
     });
 });

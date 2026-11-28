@@ -7,24 +7,33 @@
         onclose,
         children,
         actions,
+        wide = false,
     }: {
         title: string;
         onclose: () => void;
         children: Snippet;
         actions?: Snippet;
+        /** Room for a list or an editor rather than a short form. */
+        wide?: boolean;
     } = $props();
 
     let dialog: HTMLDialogElement;
     const titleId = `modal-${Math.random().toString(36).slice(2)}`;
 
+    // Show the modal and hand focus back to the element that opened it when the modal closes.
     $effect(() => {
+        const restoreTo = document.activeElement as HTMLElement | null;
         dialog.showModal();
-        return () => dialog.close();
+        return () => {
+            dialog.close();
+            if (restoreTo?.isConnected) restoreTo.focus();
+        };
     });
 </script>
 
 <dialog
     bind:this={dialog}
+    class:wide
     aria-labelledby={titleId}
     oncancel={(e) => {
         e.preventDefault();
@@ -46,6 +55,9 @@
         border-radius: 8px;
         background: var(--surface);
         color: var(--text);
+    }
+    dialog.wide {
+        width: min(56rem, calc(100vw - 2rem));
     }
     dialog::backdrop {
         background: rgb(0 0 0 / 50%);

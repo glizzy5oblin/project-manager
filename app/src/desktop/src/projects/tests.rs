@@ -67,14 +67,14 @@ fn add_rejects_non_projects() {
     let plain = tempfile::tempdir().unwrap();
     assert_eq!(
         reg.add(plain.path(), None, 0).unwrap_err().kind,
-        ErrorKind::NotARepo
+        ErrorKind::NoProjFile
     );
     let r = linear(1);
     std::fs::create_dir(r.path().join("sub")).unwrap();
     assert_eq!(
         reg.add(&r.path().join("sub"), None, 0).unwrap_err().kind,
-        ErrorKind::NotARepo,
-        "a subfolder is not the repository root"
+        ErrorKind::NoProjFile,
+        "a subfolder is not the project root"
     );
     assert_eq!(
         reg.add(r.path(), None, 0).unwrap_err().kind,
@@ -88,7 +88,7 @@ fn add_rejects_non_projects() {
     let bare = FixtureRepo::new_with(&["--bare"]);
     assert_eq!(
         reg.add(bare.path(), None, 0).unwrap_err().kind,
-        ErrorKind::InvalidInput
+        ErrorKind::NoProjFile
     );
     assert_eq!(
         reg.add(&plain.path().join("missing"), None, 0)
@@ -226,6 +226,7 @@ fn session_is_sanitized_against_the_registry() {
     let tab = |id: &str| TabState {
         project_id: id.into(),
         view: ProjectView::Graph,
+        side: RepoSide::default(),
     };
     let mut s = Session {
         tabs: vec![tab(&e.id), tab("p999"), tab(&e.id)],
@@ -245,6 +246,18 @@ fn session_is_sanitized_against_the_registry() {
     assert_eq!(s.tabs[0].view, ProjectView::Overview);
     let settings: Settings = read_json(&dir.path().join("missing.json"));
     assert_eq!(settings.theme, "dark");
+    assert!(settings.backups, "backups default to on");
+
+    // A settings file written before the backups field existed must load with the default.
+    let f = dir.path().join("settings.json");
+    std::fs::write(&f, r#"{"theme":"light"}"#).unwrap();
+    let settings: Settings = read_json(&f);
+    assert_eq!(settings.theme, "light");
+    assert!(settings.backups);
+
+    std::fs::write(&f, r#"{"theme":"light","backups":false}"#).unwrap();
+    let settings: Settings = read_json(&f);
+    assert!(!settings.backups);
 }
 
 #[test]
@@ -290,21 +303,22 @@ fn project_names() {
 fn create_both_modes() {
     let parent = tempfile::tempdir().unwrap();
     let root = create_project(parent.path(), "Two", WorkflowMode::TwoRepo).unwrap();
-    assert_eq!(root, canonical(parent.path()).join("Two/private"));
+    assert_eq!(root, canonical(parent.path()).join("Two"));
     assert!(root.join("Two.proj").exists());
-    let proj = inspect(&root).unwrap();
+    let proj = load_proj(&root).unwrap();
     assert_eq!(proj.project.name, "Two");
-    assert_eq!(proj.workflow.public.path.as_deref(), Some("../public"));
+    assert_eq!(proj.workflow.public.path.as_deref(), Some("./public"));
+    assert!(crate::git::state::open(&parent.path().join("Two/private")).is_ok());
     assert!(crate::git::state::open(&parent.path().join("Two/public")).is_ok());
-    let s = crate::git::state::read_state(&root, false).unwrap();
+    let s = crate::git::state::read_state(&root.join("private"), false).unwrap();
     assert_eq!(s.head.branch.as_deref(), Some("main"));
 
     let root = create_project(parent.path(), "One", WorkflowMode::SingleRepo).unwrap();
     assert_eq!(
-        inspect(&root).unwrap().workflow.mode,
+        load_proj(&root).unwrap().workflow.mode,
         WorkflowMode::SingleRepo
     );
-    assert_eq!(root, canonical(parent.path()).join("One/private"));
+    assert_eq!(root, canonical(parent.path()).join("One"));
     assert!(!parent.path().join("One/public").exists());
 
     let (_d, mut reg) = registry();
@@ -420,20 +434,19 @@ fn add_takes_the_private_repository_of_a_project_folder() {
     let folder = parent.path().join("Tardis");
     let (_d, mut reg) = registry();
 
-    // Without a .proj the private repository is found, so the dialog can offer a starter file.
+    // Without a .proj the project folder is found, so the dialog can offer a starter file.
     let e = reg.add(&folder, None, 0).unwrap_err();
     assert_eq!(e.kind, ErrorKind::NoProjFile, "{e:?}");
     let e = reg.add(&folder, Some(WorkflowMode::TwoRepo), 0).unwrap();
-    assert_eq!(e.path, canonical(&folder.join("private")));
+    assert_eq!(e.path, canonical(&folder));
     assert_eq!(
         e.name, "Tardis",
         "named after the project folder, not private/"
     );
-    let proj = ProjFile::load(&folder.join("private/Tardis.proj")).unwrap();
-    assert_eq!(proj.workflow.public.path.as_deref(), Some("../public"));
-    // Either folder names the same project.
+    let proj = ProjFile::load(&folder.join("Tardis.proj")).unwrap();
+    assert_eq!(proj.workflow.public.path.as_deref(), Some("./public"));
+    // The registration is found again from the same folder.
     assert_eq!(reg.add(&folder, None, 1).unwrap(), e);
-    assert_eq!(reg.add(&folder.join("private"), None, 1).unwrap(), e);
     assert_eq!(reg.list().len(), 1);
 
     // No public folder beside it: the usual sibling name.
@@ -447,12 +460,12 @@ fn add_takes_the_private_repository_of_a_project_folder() {
     let proj = ProjFile::load(&root.join("Solo.proj")).unwrap();
     assert_eq!(proj.workflow.public.path.as_deref(), Some("../Solo-public"));
 
-    // A private/ that is not a repository leaves the folder as it was: not a repository.
+    // A private/ that is not a repository leaves the folder as it was: no proj, no repo.
     let plain = tempfile::tempdir().unwrap();
     std::fs::create_dir(plain.path().join("private")).unwrap();
     assert_eq!(
         reg.add(plain.path(), None, 0).unwrap_err().kind,
-        ErrorKind::NotARepo
+        ErrorKind::NoProjFile
     );
 }
 
@@ -466,7 +479,171 @@ fn add_does_not_follow_a_private_symlink() {
     let (_d, mut reg) = registry();
     assert_eq!(
         reg.add(folder.path(), None, 0).unwrap_err().kind,
-        ErrorKind::NotARepo
+        ErrorKind::NoProjFile
     );
     assert!(reg.list().is_empty());
+}
+
+const TWO_REPO_PROJ: &str = r#"schema_version = 1
+
+[project]
+name = "Example Mod"
+version = "1.2.0"
+
+[workflow]
+mode = "two-repo"
+
+[workflow.private]
+branch = "main"
+
+[workflow.public]
+path = "../public"
+branch = "main"
+"#;
+
+/// A public repo beside the fixture, one commit and one release tag in it.
+fn public_repo(r: &FixtureRepo, tag: &str) {
+    let dir = r.sibling("public");
+    let parent = r.path().parent().unwrap().to_path_buf();
+    r.cmd_in(
+        &parent,
+        &["init", "-q", "-b", "main", dir.to_str().unwrap()],
+    );
+    std::fs::write(dir.join("readme.txt"), "hi\n").unwrap();
+    r.cmd_in(&dir, &["add", "."]);
+    r.cmd_in(&dir, &["commit", "-q", "-m", "initial"]);
+    r.cmd_in(&dir, &["tag", tag]);
+}
+
+#[test]
+fn hub_card_reads_the_release_tag_from_the_public_repo_first() {
+    let r = linear(1);
+    r.write("example.proj", TWO_REPO_PROJ);
+    r.commit_all("add proj");
+    r.tag("v1.0.0", None); // the private repo's own tag only
+    public_repo(&r, "v2.0.0");
+    let (_d, mut reg) = registry();
+    let e = reg.add(r.path(), None, 0).unwrap();
+    let s = summarize(&e);
+    assert_eq!(s.last_release.as_deref(), Some("v2.0.0"));
+}
+
+#[test]
+fn hub_card_falls_back_to_the_private_tag_when_the_public_has_none() {
+    let r = linear(1);
+    r.write("example.proj", TWO_REPO_PROJ);
+    r.commit_all("add proj");
+    r.tag("v1.0.0", None);
+    public_repo(&r, "nightly"); // not a release tag
+    let (_d, mut reg) = registry();
+    let e = reg.add(r.path(), None, 0).unwrap();
+    let s = summarize(&e);
+    assert_eq!(s.last_release.as_deref(), Some("v1.0.0"));
+}
+
+#[test]
+fn hub_card_reads_the_single_repo_release_from_the_public_branch() {
+    let r = linear(1);
+    with_proj(&r);
+    r.checkout_new("public");
+    r.commit_file("public.txt", "x\n", "public change");
+    r.tag("v1.0.0", None);
+    r.checkout("main");
+    r.commit_file("private.txt", "x\n", "private change");
+    r.tag("v3.0.0", None); // only on main, not in the public branch's history
+    let (_d, mut reg) = registry();
+    let e = reg.add(r.path(), None, 0).unwrap();
+    let s = summarize(&e);
+    assert_eq!(s.last_release.as_deref(), Some("v1.0.0"));
+}
+
+#[test]
+fn project_root_detects_new_and_legacy_layouts() {
+    // New layout: the .proj lives at the project folder, the repos beside it.
+    let parent = tempfile::tempdir().unwrap();
+    let root = create_project(parent.path(), "New", WorkflowMode::TwoRepo).unwrap();
+    assert!(
+        project_root(root.clone()) == root,
+        "proj at the root decides"
+    );
+    // The private repo of the new layout stands for the folder too (backward-tolerant).
+    assert_eq!(project_root(root.join("private")), root.join("private"));
+
+    // Legacy layout: the .proj lives inside the private repo.
+    let parent = tempfile::tempdir().unwrap();
+    let folder = parent.path().join("Old");
+    let private = folder.join("private");
+    std::fs::create_dir_all(&private).unwrap();
+    let out = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .arg(&private)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    std::fs::write(private.join("Old.proj"), TWO_REPO_PROJ).unwrap();
+    assert_eq!(project_root(folder.clone()), private);
+    assert_eq!(project_root(private.clone()), private);
+
+    // Single-repo at the root: the folder holding the proj is the root.
+    let r = linear(1);
+    with_proj(&r);
+    assert_eq!(project_root(r.path().to_path_buf()), r.path().to_path_buf());
+}
+
+#[test]
+fn summarize_round_trips_on_the_new_layout() {
+    // A two-repo project the way create_project makes it: proj at the folder,
+    // private/ and public/ repos inside.
+    let parent = tempfile::tempdir().unwrap();
+    let root = create_project(parent.path(), "App", WorkflowMode::TwoRepo).unwrap();
+    let private = root.join("private");
+    // One commit so the hub has something to read.
+    std::fs::write(private.join("README.md"), "x\n").unwrap();
+    git_in(&private, &["add", "-A"]);
+    git_in(
+        &private,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "add readme",
+        ],
+    );
+    let (_d, mut reg) = registry();
+    let e = reg.add(&root, None, 0).unwrap();
+    assert_eq!(e.path, canonical(&root));
+    assert_eq!(e.name, "App");
+    let s = summarize(&e);
+    assert_eq!(s.name, "App");
+    assert_eq!(s.version.as_deref(), Some("0.0.1"));
+    assert_eq!(s.mode, Some(WorkflowMode::TwoRepo));
+    assert_eq!(s.branch.as_deref(), Some("main"));
+    assert_eq!(s.proj_error, None);
+    assert_eq!(s.repo_error, None);
+}
+
+fn git_in(path: &std::path::Path, args: &[&str]) {
+    let home = path.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
+        .env("HOME", &home)
+        .env("GIT_AUTHOR_NAME", "Fixture Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture Committer")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

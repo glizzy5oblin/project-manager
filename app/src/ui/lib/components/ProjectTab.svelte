@@ -7,11 +7,14 @@
     import type { RefLabel } from "../bindings/RefLabel";
     import type { ProjectSummary } from "../bindings/ProjectSummary";
     import type { ProjectView } from "../bindings/ProjectView";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { RepoState } from "../bindings/RepoState";
     import { operationLabel } from "../format";
     import { VIEWS } from "../tabs";
     import ActivityView from "./ActivityView.svelte";
+    import ReleaseView from "./ReleaseView.svelte";
     import ChangesView from "./ChangesView.svelte";
+    import StagingView from "./StagingView.svelte";
     import CommitPanel from "./CommitPanel.svelte";
     import ErrorBox from "./ErrorBox.svelte";
     import FilesView from "./FilesView.svelte";
@@ -21,22 +24,33 @@
         id,
         summary,
         view,
+        side,
         active,
         changed,
         onview,
+        onside,
     }: {
         id: string;
         summary: ProjectSummary | undefined;
         view: ProjectView;
+        /** Which repository of a two-repo project is showing (always "private" otherwise). */
+        side: RepoSide;
         active: boolean;
         /** Bumped when the project's files change on disk. */
         changed: number;
         onview: (v: ProjectView) => void;
+        onside: (s: RepoSide) => void;
     } = $props();
+
+    // A two-repo project has a separate public repo to switch to; single-repo has only one side.
+    const twoRepo = $derived(summary?.mode === "two-repo");
+    // The side actually in effect: "public" only makes sense for a two-repo project.
+    const repoSide = $derived<RepoSide>(twoRepo ? side : "private");
 
     let repo = $state<RepoState | null>(null);
     let error = $state<AppError | null>(null);
     let loadedAt = -1;
+    let loadedSide: RepoSide | null = null;
 
     async function reload() {
         await load(changed);
@@ -44,17 +58,25 @@
 
     async function load(tick: number) {
         loadedAt = tick;
+        loadedSide = repoSide;
+        const want = repoSide;
         try {
-            repo = await api.projectState(id);
-            error = null;
+            const next = await api.projectState(id, want);
+            // A side switch mid-flight would otherwise show the wrong repo's state.
+            if (repoSide === want) {
+                repo = next;
+                error = null;
+            }
         } catch (e) {
-            error = e as AppError;
+            if (repoSide === want) error = e as AppError;
         }
     }
 
-    // Load when first shown, and again on changes, but only while this tab is showing.
+    // Load when first shown, again on changes, and whenever the side switches, but only while
+    // this tab is showing.
     $effect(() => {
-        if (active && loadedAt !== changed) void load(changed);
+        if (active && (loadedAt !== changed || loadedSide !== repoSide))
+            void load(changed);
     });
 
     // The graph and the log share one history view (and its selection); it is created the first
@@ -114,8 +136,6 @@
 
     const head = $derived(repo?.branches.find((b) => b.isHead));
     const placeholders: Partial<Record<ProjectView, string>> = {
-        staging: "Private to public staging arrives in Phase 4.",
-        releases: "The release suite arrives in Phase 5.",
         settings:
             "Project settings (editing the .proj file) arrive in a later phase.",
     };
@@ -136,6 +156,33 @@
 <div class="project">
     <nav class="side" aria-label="Project views">
         <div class="title" title={summary?.path}>{summary?.name ?? id}</div>
+        {#if twoRepo}
+            <div
+                class="sides"
+                role="group"
+                aria-label="Repository side"
+                title="Switch between this project's private working repo and its public release repo"
+            >
+                <button
+                    title="Show this project's private working repo"
+                    type="button"
+                    class:current={repoSide === "private"}
+                    aria-pressed={repoSide === "private"}
+                    onclick={() => onside("private")}
+                >
+                    Private
+                </button>
+                <button
+                    title="Show this project's public release repo"
+                    type="button"
+                    class:current={repoSide === "public"}
+                    aria-pressed={repoSide === "public"}
+                    onclick={() => onside("public")}
+                >
+                    Public
+                </button>
+            </div>
+        {/if}
         {#each VIEWS as v (v.id)}
             <button
                 title={v.hint}
@@ -149,189 +196,213 @@
         {/each}
     </nav>
 
-    {#if historyOpened}
-        <section
-            class="main flush"
-            hidden={!isHistory}
-            bind:this={splitBox}
-            style:grid-template-rows={selected
-                ? `minmax(${LIST_MIN}px, ${split * 100}%) 6px minmax(${PANEL_MIN}px, 1fr)`
-                : "minmax(0, 1fr)"}
-        >
-            <HistoryView
-                {id}
-                active={active && isHistory}
-                {changed}
-                showGraph={view === "graph"}
-                head={repo?.head ?? null}
-                bind:selected
-                bind:selectedRefs
-                bind:path={historyPath}
-            />
-            {#if selected}
-                <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (a focusable separator is the ARIA splitter pattern) -->
-                <div
-                    class="splitter"
-                    role="separator"
-                    title="Drag to resize, or use the up and down arrow keys"
-                    aria-orientation="horizontal"
-                    aria-label="Resize the commit details"
-                    aria-valuenow={Math.round(split * 100)}
-                    aria-valuemin={15}
-                    aria-valuemax={85}
-                    tabindex="0"
-                    onpointerdown={dragSplit}
-                    onkeydown={splitKey}
-                ></div>
-                <CommitPanel
-                    projectId={id}
-                    commit={selected}
-                    refs={selectedRefs}
-                    head={repo?.head ?? null}
-                    bind:diffMode
-                    onjump={(c) => (selected = c)}
-                    onclose={() => (selected = null)}
-                    onhistory={(p) => {
-                        historyPath = p;
-                        onview("log");
-                    }}
-                />
-            {/if}
-        </section>
-    {/if}
-    {#if view === "changes"}
-        <section class="main flush changes">
-            {#if error}
-                <div class="pad"><ErrorBox {error} /></div>
-            {:else if repo}
-                <ChangesView
-                    projectId={id}
-                    {repo}
-                    {changed}
-                    bind:message={draft}
-                    bind:amend
-                    bind:diffMode
-                    onreload={reload}
-                    onopenfile={(p) => {
-                        filePath = p;
-                        onview("files");
-                    }}
-                />
-            {:else}
-                <p class="muted pad">Loading…</p>
-            {/if}
-        </section>
-    {/if}
-    {#if view === "files"}
-        <section class="main flush changes">
-            <FilesView projectId={id} {changed} bind:path={filePath} />
-        </section>
-    {/if}
-    <section
-        class="main"
-        hidden={isHistory || view === "changes" || view === "files"}
-    >
-        {#if view === "activity"}
-            <ActivityView
-                projectId={id}
-                root={summary?.path}
-                {active}
-                onreload={reload}
-            />
-        {:else if view === "overview"}
-            <h2>Overview</h2>
-            {#if error}
-                <ErrorBox {error} />
-            {:else if repo}
-                {#if !repo.trusted}
-                    <p class="warn">
-                        This repository is owned by another user. Project
-                        Manager will ask before writing to it.
-                    </p>
-                {/if}
-                {#if repo.inProgress}
-                    <p class="warn">
-                        {operationLabel(repo.inProgress)} in progress.
-                    </p>
-                {/if}
-                {#if repo.hasSubmodules}
-                    <p class="warn">
-                        This repository uses submodules; Project Manager does
-                        not manage them.
-                    </p>
-                {/if}
-                <dl>
-                    <dt>Folder</dt>
-                    <dd>
-                        <code>{repo.root}</code>
-                        <button
-                            type="button"
-                            class="folder"
-                            title="Show this project's folder in your file manager"
-                            onclick={() =>
-                                api
-                                    .openFolder(id)
-                                    .catch((e) => (error = e as AppError))}
-                        >
-                            Open folder
-                        </button>
-                    </dd>
-                    <dt>Branch</dt>
-                    <dd>
-                        {#if repo.head.detached}
-                            detached at <code>
-                                {repo.head.commit?.slice(0, 10)}
-                            </code>
-                        {:else}
-                            <code>{repo.head.branch}</code>
-                            {#if !repo.head.commit}(no commits yet){/if}
-                        {/if}
-                    </dd>
-                    <dt>Upstream</dt>
-                    <dd>
-                        {#if head?.upstream}
-                            <code>{head.upstream}</code>
-                            {#if head.ahead !== null}· {head.ahead} to push, {head.behind}
-                                to pull{/if}
-                        {:else}
-                            none
-                        {/if}
-                    </dd>
-                    {#if repo.status}
-                        <dt>Changes</dt>
-                        <dd>
-                            {repo.status.staged.length} staged, {repo.status
-                                .unstaged.length} modified,
-                            {repo.status.untracked.length} new{#if repo.status.conflicted.length},
-                                <span class="bad">
-                                    {repo.status.conflicted.length} conflicted
-                                </span>{/if}
-                        </dd>
-                    {/if}
-                    <dt>Branches</dt>
-                    <dd>
-                        {repo.branches.length} local, {repo.remoteBranches
-                            .length} remote
-                    </dd>
-                    <dt>Tags</dt>
-                    <dd>{repo.tags.length}</dd>
-                    <dt>Remotes</dt>
-                    <dd>
-                        {#each repo.remotes as r (r.name)}
-                            <div><code>{r.name}</code> {r.fetchUrl ?? ""}</div>
-                        {:else}
-                            none
-                        {/each}
-                    </dd>
-                </dl>
-            {:else}
-                <p class="muted">Loading…</p>
-            {/if}
-        {:else}
-            <h2>{VIEWS.find((v) => v.id === view)?.label}</h2>
-            <p class="muted">{placeholders[view]}</p>
+    <div class="content">
+        {#if twoRepo && repoSide === "public"}
+            <p class="banner">
+                Public release repo — changes here are normally made from
+                Staging.
+            </p>
         {/if}
-    </section>
+        {#if historyOpened}
+            <section
+                class="main flush"
+                hidden={!isHistory}
+                bind:this={splitBox}
+                style:grid-template-rows={selected
+                    ? `minmax(${LIST_MIN}px, ${split * 100}%) 6px minmax(${PANEL_MIN}px, 1fr)`
+                    : "minmax(0, 1fr)"}
+            >
+                <HistoryView
+                    {id}
+                    side={repoSide}
+                    active={active && isHistory}
+                    {changed}
+                    showGraph={view === "graph"}
+                    head={repo?.head ?? null}
+                    bind:selected
+                    bind:selectedRefs
+                    bind:path={historyPath}
+                />
+                {#if selected}
+                    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions (a focusable separator is the ARIA splitter pattern) -->
+                    <div
+                        class="splitter"
+                        role="separator"
+                        title="Drag to resize, or use the up and down arrow keys"
+                        aria-orientation="horizontal"
+                        aria-label="Resize the commit details"
+                        aria-valuenow={Math.round(split * 100)}
+                        aria-valuemin={15}
+                        aria-valuemax={85}
+                        tabindex="0"
+                        onpointerdown={dragSplit}
+                        onkeydown={splitKey}
+                    ></div>
+                    <CommitPanel
+                        projectId={id}
+                        side={repoSide}
+                        commit={selected}
+                        refs={selectedRefs}
+                        head={repo?.head ?? null}
+                        bind:diffMode
+                        onjump={(c) => (selected = c)}
+                        onclose={() => (selected = null)}
+                        onhistory={(p) => {
+                            historyPath = p;
+                            onview("log");
+                        }}
+                    />
+                {/if}
+            </section>
+        {/if}
+        {#if view === "changes"}
+            <section class="main flush changes">
+                {#if error}
+                    <div class="pad"><ErrorBox {error} /></div>
+                {:else if repo}
+                    <ChangesView
+                        projectId={id}
+                        side={repoSide}
+                        {repo}
+                        {changed}
+                        bind:message={draft}
+                        bind:amend
+                        bind:diffMode
+                        onreload={reload}
+                        onopenfile={(p) => {
+                            filePath = p;
+                            onview("files");
+                        }}
+                    />
+                {:else}
+                    <p class="muted pad">Loading…</p>
+                {/if}
+            </section>
+        {/if}
+        {#if view === "files"}
+            <section class="main flush changes">
+                <FilesView
+                    projectId={id}
+                    side={repoSide}
+                    {changed}
+                    bind:path={filePath}
+                />
+            </section>
+        {/if}
+        <section
+            class="main"
+            hidden={isHistory || view === "changes" || view === "files"}
+        >
+            {#if view === "activity"}
+                <ActivityView
+                    projectId={id}
+                    side={repoSide}
+                    root={repo?.root ?? summary?.path}
+                    {active}
+                    onreload={reload}
+                />
+            {:else if view === "staging"}
+                <StagingView projectId={id} {changed} {active} />
+            {:else if view === "overview"}
+                <h2>Overview</h2>
+                {#if error}
+                    <ErrorBox {error} />
+                {:else if repo}
+                    {#if !repo.trusted}
+                        <p class="warn">
+                            This repository is owned by another user. Project
+                            Manager will ask before writing to it.
+                        </p>
+                    {/if}
+                    {#if repo.inProgress}
+                        <p class="warn">
+                            {operationLabel(repo.inProgress)} in progress.
+                        </p>
+                    {/if}
+                    {#if repo.hasSubmodules}
+                        <p class="warn">
+                            This repository uses submodules; Project Manager
+                            does not manage them.
+                        </p>
+                    {/if}
+                    <dl>
+                        <dt>Folder</dt>
+                        <dd>
+                            <code>{repo.root}</code>
+                            <button
+                                type="button"
+                                class="folder"
+                                title="Show this project's folder in your file manager"
+                                onclick={() =>
+                                    api
+                                        .openFolder(id, null, repoSide)
+                                        .catch((e) => (error = e as AppError))}
+                            >
+                                Open folder
+                            </button>
+                        </dd>
+                        <dt>Branch</dt>
+                        <dd>
+                            {#if repo.head.detached}
+                                detached at <code>
+                                    {repo.head.commit?.slice(0, 10)}
+                                </code>
+                            {:else}
+                                <code>{repo.head.branch}</code>
+                                {#if !repo.head.commit}(no commits yet){/if}
+                            {/if}
+                        </dd>
+                        <dt>Upstream</dt>
+                        <dd>
+                            {#if head?.upstream}
+                                <code>{head.upstream}</code>
+                                {#if head.ahead !== null}· {head.ahead} to push, {head.behind}
+                                    to pull{/if}
+                            {:else}
+                                none
+                            {/if}
+                        </dd>
+                        {#if repo.status}
+                            <dt>Changes</dt>
+                            <dd>
+                                {repo.status.staged.length} staged, {repo.status
+                                    .unstaged.length} modified,
+                                {repo.status.untracked.length} new{#if repo.status.conflicted.length},
+                                    <span class="bad">
+                                        {repo.status.conflicted.length} conflicted
+                                    </span>{/if}
+                            </dd>
+                        {/if}
+                        <dt>Branches</dt>
+                        <dd>
+                            {repo.branches.length} local, {repo.remoteBranches
+                                .length} remote
+                        </dd>
+                        <dt>Tags</dt>
+                        <dd>{repo.tags.length}</dd>
+                        <dt>Remotes</dt>
+                        <dd>
+                            {#each repo.remotes as r (r.name)}
+                                <div>
+                                    <code>{r.name}</code>
+                                    {r.fetchUrl ?? ""}
+                                </div>
+                            {:else}
+                                none
+                            {/each}
+                        </dd>
+                    </dl>
+                {:else}
+                    <p class="muted">Loading…</p>
+                {/if}
+            {:else if view === "releases"}
+                <ReleaseView projectId={id} {changed} {active} />
+            {:else}
+                <h2>{VIEWS.find((v) => v.id === view)?.label}</h2>
+                <p class="muted">{placeholders[view]}</p>
+            {/if}
+        </section>
+    </div>
 </div>
 
 <style>
@@ -356,6 +427,45 @@
         font-weight: 600;
         text-overflow: ellipsis;
         white-space: nowrap;
+    }
+    .sides {
+        display: flex;
+        gap: 2px;
+        margin: 0 0.25rem 0.6rem;
+        padding: 2px;
+        border-radius: 6px;
+        background: var(--surface-2);
+    }
+    .side .sides button {
+        flex: 1;
+        padding: 0.25rem 0.4rem;
+        border-radius: 4px;
+        color: var(--text-muted);
+        text-align: center;
+    }
+    .side .sides button.current {
+        box-shadow: none;
+        background: var(--bg);
+        color: var(--text);
+    }
+    .content {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+    }
+    .content > .main {
+        flex: 1 1 auto;
+    }
+    .banner {
+        flex: 0 0 auto;
+        margin: 0;
+        padding: 0.4rem 1.5rem;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--text-muted);
+        font-size: 0.85rem;
     }
     .side button {
         padding: 0.4rem 0.6rem;

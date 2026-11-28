@@ -6,6 +6,7 @@
     import type { Action } from "../bindings/Action";
     import type { AppError } from "../bindings/AppError";
     import type { GitVersion } from "../bindings/GitVersion";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { StashEntry } from "../bindings/StashEntry";
     import { formatDay, formatTime } from "../history";
     import { gitAtLeast, stashMeta, stashTitle } from "../stash";
@@ -13,6 +14,7 @@
 
     let {
         projectId,
+        side = "private",
         changed,
         busy,
         canStash,
@@ -24,6 +26,8 @@
         gitVersion,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project to list stashes of. */
+        side?: RepoSide;
         /** Bumped when the project's files change on disk; the list reloads. */
         changed: number;
         busy: boolean;
@@ -51,8 +55,9 @@
     $effect(() => {
         void changed;
         const id = projectId;
+        const s = side;
         const mine = ++request;
-        api.stashList(id).then(
+        api.stashList(id, s).then(
             (l) => {
                 if (mine !== request) return;
                 list = l;

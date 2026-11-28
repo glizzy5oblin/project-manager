@@ -70,6 +70,89 @@ pub struct Staging {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub overrides: Overrides,
+    /// Files published under another name: private path -> public path. The public path is
+    /// managed from the mapped file alone, and the private file is staged only under the mapped
+    /// name (e.g. `"publish/Makefile" = "Makefile"` keeps the private Makefile private).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub map: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub leak: Leak,
+}
+
+/// The leak scan: which files may not be staged as-is, and which paths are exempt.
+///
+/// Blockers require an explicit `allow` (a project-level exemption in `.proj`, or a one-time
+/// per-file allow in the sync call); warnings do not block. Built-in defaults cover the agreed
+/// rule families; every list is configurable per project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Leak {
+    /// Decompiled-code folder names, any path segment matching one of these blocks (case-insensitive).
+    #[serde(default = "default_leak_folders")]
+    pub folders: Vec<String>,
+    /// Decompiled-code file extensions (without a dot), e.g. `dll` for `lib.dll`.
+    #[serde(default = "default_leak_extensions")]
+    pub extensions: Vec<String>,
+    /// Packed asset archives (extensions without a dot), e.g. `pak` for `assets.pak`.
+    #[serde(default = "default_leak_archives")]
+    pub archives: Vec<String>,
+    /// Extra regexes matched against file contents. A match blocks.
+    #[serde(default)]
+    pub custom_regexes: Vec<String>,
+    /// Globs exempting files from the whole scan (keys, env files, decompiled code, size).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Files larger than this are blocked, unless they are LFS-tracked. Defaults to 100 MB.
+    #[serde(default)]
+    pub max_file_bytes: Option<u64>,
+    /// Files larger than this are warned about (they still stage). Defaults to 50 MB.
+    #[serde(default)]
+    pub warn_file_bytes: Option<u64>,
+}
+
+impl Default for Leak {
+    fn default() -> Self {
+        Leak {
+            folders: default_leak_folders(),
+            extensions: default_leak_extensions(),
+            archives: default_leak_archives(),
+            custom_regexes: Vec::new(),
+            allow: Vec::new(),
+            max_file_bytes: None,
+            warn_file_bytes: None,
+        }
+    }
+}
+
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_WARN_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn default_leak_folders() -> Vec<String> {
+    [
+        "decompiled",
+        "dump",
+        "ilspy",
+        "ghidra",
+        "cpp2il",
+        "il2cppdumper",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_leak_extensions() -> Vec<String> {
+    ["dll", "exe", "so", "il", "idb"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_leak_archives() -> Vec<String> {
+    ["pak", "bundle", "unity3d", "assets", "vpk"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Manual per-file choices layered on top of the globs. Entries are exact paths or globs.
@@ -82,6 +165,20 @@ pub struct Overrides {
     pub exclude: Vec<String>,
 }
 
+/// One recorded release. Added to `[[release.history]]` when a tag is created; nothing else
+/// writes it. The `date` is the tag's author date (the release date).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseHistoryEntry {
+    /// The tag name, e.g. `v1.2.3`.
+    pub tag: String,
+    /// The version in the tag (without the `v`).
+    pub version: String,
+    /// The tag's author date (`YYYY-MM-DD`).
+    pub date: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
@@ -91,8 +188,16 @@ pub struct Release {
     /// Release zip name. Placeholders: `{name}`, `{version}`.
     #[serde(default = "default_asset_name")]
     pub asset_name: String,
+    /// Conventional-commit prefixes the release notes group by, in display order
+    /// (e.g. `["feat", "fix", "docs"]`). The default is the usual short list; a commit that
+    /// matches none of them lands in an "Other changes" group.
+    #[serde(default = "default_changelog_groups")]
+    pub changelog_groups: Vec<String>,
     #[serde(default)]
     pub targets: Vec<ReleaseTarget>,
+    /// The recorded releases, oldest first. One entry per tag; added by `create_tag`.
+    #[serde(default)]
+    pub history: Vec<ReleaseHistoryEntry>,
 }
 
 impl Default for Release {
@@ -100,7 +205,9 @@ impl Default for Release {
         Release {
             version_files: Vec::new(),
             asset_name: default_asset_name(),
+            changelog_groups: default_changelog_groups(),
             targets: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -109,6 +216,15 @@ pub(crate) const ASSET_PLACEHOLDERS: &[&str] = &["name", "version"];
 
 fn default_asset_name() -> String {
     "{name}-{version}.zip".to_string()
+}
+
+fn default_changelog_groups() -> Vec<String> {
+    [
+        "feat", "fix", "perf", "docs", "refactor", "test", "build", "ci", "chore",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -197,7 +197,7 @@ fn graph_order(g: &super::graph::Graph) -> Vec<(String, Vec<String>)> {
 const ALL: &[&str] = &["--branches", "--remotes", "--tags", "HEAD"];
 
 fn assert_matches_git(r: &FixtureRepo) {
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     assert_eq!(graph_order(&g), git_order(r, ALL));
     let parents: Vec<Vec<u32>> = (0..g.len()).map(|i| g.parents_of(i).to_vec()).collect();
     check_connectivity(&g.layout, &parents);
@@ -227,7 +227,7 @@ fn graph_is_topological_with_same_second_commits() {
     // depends on its walk internals; we only promise a valid order and the same commit set.
     for seed in 1..=3 {
         let r = branchy_history(300, 6, seed, true);
-        let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+        let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
         let want: BTreeSet<String> = git_order(&r, ALL).into_iter().map(|c| c.0).collect();
         let got: BTreeSet<String> = graph_order(&g).into_iter().map(|c| c.0).collect();
         assert_eq!(got, want);
@@ -242,7 +242,7 @@ fn graph_is_topological_with_same_second_commits() {
 #[test]
 fn graph_of_empty_repo() {
     let r = FixtureRepo::new();
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     assert!(g.is_empty());
     let info = g.info();
     assert_eq!(info.rows, 0);
@@ -257,7 +257,7 @@ fn graph_filters_by_ref() {
         refs: Some(vec!["refs/heads/feature/a".into()]),
         highlight: None,
     };
-    let g = build(r.path(), &opts, 1).unwrap();
+    let g = build(r.path(), &opts, 1, None).unwrap();
     assert_eq!(graph_order(&g), git_order(&r, &["feature/a"]));
 
     let opts = GraphOptions {
@@ -267,14 +267,14 @@ fn graph_filters_by_ref() {
         ]),
         highlight: None,
     };
-    let g = build(r.path(), &opts, 1).unwrap();
+    let g = build(r.path(), &opts, 1, None).unwrap();
     assert_eq!(graph_order(&g), git_order(&r, &["feature/a", "feature/b"]));
 
     let opts = GraphOptions {
         refs: Some(vec!["refs/heads/nope".into()]),
         highlight: None,
     };
-    let err = build(r.path(), &opts, 1)
+    let err = build(r.path(), &opts, 1, None)
         .err()
         .expect("unknown ref is an error");
     assert!(err.to_string().contains("refs/heads/nope"), "{err}");
@@ -287,7 +287,7 @@ fn graph_highlight_dims_other_commits() {
         refs: None,
         highlight: Some("refs/heads/feature/b".into()),
     };
-    let g = build(r.path(), &opts, 1).unwrap();
+    let g = build(r.path(), &opts, 1, None).unwrap();
     let bright: BTreeSet<String> = r
         .git(&["rev-list", "feature/b"])
         .lines()
@@ -301,7 +301,7 @@ fn graph_highlight_dims_other_commits() {
 #[test]
 fn graph_rows_carry_labels_and_text() {
     let r = many_branches(3);
-    let g = build(r.path(), &GraphOptions::default(), 7).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 7, None).unwrap();
     let info = g.info();
     assert_eq!(info.generation, 7);
     let total: usize = r.git(&["rev-list", "--count", "--all"]).parse().unwrap();
@@ -385,7 +385,7 @@ fn workflow_refs_name_existing_private_and_public_branches() {
 fn graph_labels_remotes_and_detached_head() {
     let (clone, _remote) = ahead_behind();
     clone.git(&["checkout", "-q", "--detach", "HEAD~1"]);
-    let g = build(clone.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(clone.path(), &GraphOptions::default(), 1, None).unwrap();
     let info = g.info();
     let names: Vec<(&str, RefKind)> = info
         .refs
@@ -418,19 +418,49 @@ fn graph_leaves_out_backups_and_stash() {
     r.git(&["update-ref", "refs/pm/backups/x", "HEAD~1"]);
     r.write("file.txt", "dirty\n");
     r.git(&["stash", "-q"]);
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     assert_eq!(g.len(), 2, "the stash commits are not in the graph");
     assert!(g.info().refs.iter().all(|l| !l.full.starts_with("refs/pm")));
+}
+
+#[test]
+fn graph_marks_ancestors_of_the_synced_commit_as_staged() {
+    let r = linear(4);
+    // The second commit is the tip the last sync covered.
+    let upto = gix::ObjectId::from_hex(r.rev("HEAD~1").as_bytes()).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, Some(upto)).unwrap();
+    let stages: Vec<bool> = (0..g.len())
+        .map(|r| g.rows(r as u32, 1).unwrap()[0].staged)
+        .collect();
+    assert_eq!(
+        stages,
+        vec![false, true, true, true],
+        "only commits newer than the synced commit are pending"
+    );
+
+    // A synced commit outside the walk marks nothing.
+    let unknown = gix::ObjectId::from_hex(b"0000000000000000000000000000000000000000").unwrap();
+    let hidden = linear(2);
+    let g2 = build(hidden.path(), &GraphOptions::default(), 1, Some(unknown)).unwrap();
+    assert!(
+        (0..g2.len()).all(|r| !g2.rows(r as u32, 1).unwrap()[0].staged),
+        "commits outside the walk are not marked"
+    );
+
+    // A graph built before any sync knows nothing: no row is staged.
+    let fresh = linear(2);
+    let g3 = build(fresh.path(), &GraphOptions::default(), 1, None).unwrap();
+    assert!((0..g3.len()).all(|r| !g3.rows(r as u32, 1).unwrap()[0].staged));
 }
 
 #[test]
 fn graph_key_changes_with_refs() {
     let r = linear(2);
     let opts = GraphOptions::default();
-    let g = build(r.path(), &opts, 1).unwrap();
-    assert_eq!(current_key(r.path(), &opts).unwrap(), g.key);
+    let g = build(r.path(), &opts, 1, None).unwrap();
+    assert_eq!(current_key(r.path(), &opts, None).unwrap(), g.key);
     r.commit_file("file.txt", "more\n", "more");
-    assert_ne!(current_key(r.path(), &opts).unwrap(), g.key);
+    assert_ne!(current_key(r.path(), &opts, None).unwrap(), g.key);
 }
 
 #[test]
@@ -438,12 +468,12 @@ fn graph_key_changes_when_head_moves_to_a_branch_at_the_same_commit() {
     let r = linear(2);
     r.git(&["branch", "other"]);
     let opts = GraphOptions::default();
-    let g = build(r.path(), &opts, 1).unwrap();
+    let g = build(r.path(), &opts, 1, None).unwrap();
     r.git(&["switch", "-q", "other"]);
-    let key = current_key(r.path(), &opts).unwrap();
+    let key = current_key(r.path(), &opts, None).unwrap();
     assert_eq!(key.head, g.key.head, "same commit");
     assert_ne!(key, g.key, "the graph must rebuild so the HEAD label moves");
-    let g2 = build(r.path(), &opts, 2).unwrap();
+    let g2 = build(r.path(), &opts, 2, None).unwrap();
     // Both branches sit on the newest commit, row 0.
     let head_branch = |g: &super::graph::Graph| {
         g.labels(0)
@@ -455,13 +485,13 @@ fn graph_key_changes_when_head_moves_to_a_branch_at_the_same_commit() {
     assert_eq!(head_branch(&g2).as_deref(), Some("other"));
 
     r.git(&["switch", "-q", "--detach"]);
-    assert_ne!(current_key(r.path(), &opts).unwrap(), key, "detached");
+    assert_ne!(current_key(r.path(), &opts, None).unwrap(), key, "detached");
 }
 
 #[test]
 fn graph_find_by_full_and_short_id() {
     let r = merges();
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     let head = r.head();
     let row = g.find(&head).unwrap().unwrap();
     assert_eq!(g.id(row as usize).to_string(), head);
@@ -480,7 +510,7 @@ fn graph_find_by_full_and_short_id() {
 use super::search::{LogQuery, clean_path, search};
 
 fn search_rows(r: &FixtureRepo, q: &LogQuery) -> Vec<String> {
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     let res = search(&g, q, || false).unwrap();
     res.rows
         .iter()
@@ -658,14 +688,14 @@ fn search_dates_and_branch_match_git() {
         branch: Some("refs/heads/none".into()),
         ..Default::default()
     };
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     assert!(search(&g, &q, || false).is_err());
 }
 
 #[test]
 fn search_rejects_bad_input_and_can_be_cancelled() {
     let r = linear(3);
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     for bad in ["", "/", "a/../b", "./", "a//b", "a/./b"] {
         assert!(clean_path(bad).is_err(), "{bad:?}");
     }
@@ -1250,7 +1280,7 @@ fn history_benchmark() {
         let generate = t.elapsed();
         let before = rss();
         let t = Instant::now();
-        let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+        let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
         let built = t.elapsed();
         let mem = rss().saturating_sub(before);
         let t = Instant::now();
@@ -1260,7 +1290,7 @@ fn history_benchmark() {
         let _ = g.rows(n as u32 / 2, 200).unwrap();
         let mid_rows = t.elapsed();
         let t = Instant::now();
-        let key = current_key(r.path(), &GraphOptions::default()).unwrap();
+        let key = current_key(r.path(), &GraphOptions::default(), None).unwrap();
         let key_time = t.elapsed();
         assert!(key == g.key);
         let t = Instant::now();
@@ -1298,7 +1328,7 @@ fn history_benchmark() {
 }
 
 fn branched_at(r: &FixtureRepo) -> Vec<(String, Vec<String>)> {
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     g.rows(0, g.len() as u32)
         .unwrap()
         .into_iter()
@@ -1364,7 +1394,7 @@ fn a_branch_point_gives_the_branch_its_own_colour_on_the_shared_lane() {
     r.git(&["switch", "-q", "-c", "dev"]);
     r.commit_file("a.txt", "a\n", "on dev 1");
     r.commit_file("b.txt", "b\n", "on dev 2");
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     let rows = g.rows(0, g.len() as u32).unwrap();
     // dev 2, dev 1, main (the branch point), first commit.
     assert!(rows.iter().all(|row| row.lane == 0), "one lane");
@@ -1393,7 +1423,7 @@ fn the_main_branch_is_colour_zero_and_others_never_are() {
     r.git(&["switch", "-q", "main"]);
     r.commit_file("m.txt", "m\n", "on main");
     r.merge(&["a"], "merge a");
-    let g = build(r.path(), &GraphOptions::default(), 1).unwrap();
+    let g = build(r.path(), &GraphOptions::default(), 1, None).unwrap();
     let main_ids: Vec<String> = r
         .git(&["rev-list", "--first-parent", "main"])
         .lines()

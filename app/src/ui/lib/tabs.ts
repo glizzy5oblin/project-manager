@@ -2,6 +2,7 @@
 // means the hub is showing.
 
 import type { ProjectView } from "./bindings/ProjectView";
+import type { RepoSide } from "./bindings/RepoSide";
 import type { Session } from "./bindings/Session";
 
 export const VIEWS: { id: ProjectView; label: string; hint: string }[] = [
@@ -33,7 +34,7 @@ export const VIEWS: { id: ProjectView; label: string; hint: string }[] = [
     {
         id: "staging",
         label: "Staging",
-        hint: "Move work from the private branch to the public one (coming later)",
+        hint: "Move work from the private side into the public one",
     },
     {
         id: "releases",
@@ -56,7 +57,14 @@ export const VIEWS: { id: ProjectView; label: string; hint: string }[] = [
 export function openTab(s: Session, projectId: string): Session {
     const tabs = s.tabs.some((t) => t.projectId === projectId)
         ? s.tabs
-        : [...s.tabs, { projectId, view: "overview" as ProjectView }];
+        : [
+              ...s.tabs,
+              {
+                  projectId,
+                  view: "overview" as ProjectView,
+                  side: "private" as RepoSide,
+              },
+          ];
     return { tabs, active: projectId };
 }
 
@@ -91,6 +99,19 @@ export function setView(
         ...s,
         tabs: s.tabs.map((t) =>
             t.projectId === projectId ? { ...t, view } : t,
+        ),
+    };
+}
+
+export function setSide(
+    s: Session,
+    projectId: string,
+    side: RepoSide,
+): Session {
+    return {
+        ...s,
+        tabs: s.tabs.map((t) =>
+            t.projectId === projectId ? { ...t, side } : t,
         ),
     };
 }

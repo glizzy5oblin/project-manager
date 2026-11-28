@@ -21,4 +21,8 @@ authorTime: number,
 /**
  * Not reachable from the highlighted ref.
  */
-dim: boolean, };
+dim: boolean, 
+/**
+ * Whether the commit is an ancestor of (or equal to) the last synced commit.
+ */
+staged: boolean, };

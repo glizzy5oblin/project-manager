@@ -440,6 +440,50 @@ fn retention_by_count_and_age() {
 }
 
 #[test]
+fn cleanup_preview_lists_what_cleanup_deletes() {
+    let r = linear(1);
+    let b = backups(&r);
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        ids.push(
+            b.create("reset-hard", &BackupOptions::default())
+                .unwrap()
+                .id,
+        );
+        // Age the newest so the list is not all "now".
+        let mut index = b.read_index().unwrap();
+        if let Some(rec) = index
+            .backups
+            .iter_mut()
+            .find(|x| x.id == *ids.last().unwrap())
+        {
+            rec.created = unix_now() - (4 - i as u64) * 86_400;
+        }
+        b.write_index(&index).unwrap();
+    }
+    let now = unix_now();
+    let policy = Retention {
+        max_count: Some(2),
+        max_age_days: None,
+    };
+    let preview = b.cleanup_preview(policy, now).unwrap();
+    assert_eq!(
+        preview.len(),
+        2,
+        "the two oldest sit beyond the count limit"
+    );
+    assert!(preview.iter().all(|b| ids.contains(&b.id)));
+    // Nothing deleted by the preview.
+    assert_eq!(b.list().unwrap().len(), 4);
+    let deleted = b.cleanup(policy, now).unwrap();
+    assert_eq!(deleted.len(), 2);
+    assert_eq!(b.list().unwrap().len(), 2);
+    // Cleanup on an empty or fully-inside-limits list deletes nothing.
+    let again = b.cleanup(policy, now).unwrap();
+    assert!(again.is_empty());
+}
+
+#[test]
 fn lfs_files_round_trip() {
     let Some(r) = lfs() else {
         eprintln!("skipped: git-lfs not installed");

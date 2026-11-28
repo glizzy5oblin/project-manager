@@ -118,6 +118,8 @@ pub struct GraphRow {
     pub author_time: i64,
     /// Not reachable from the highlighted ref.
     pub dim: bool,
+    /// Whether the commit is an ancestor of (or equal to) the last synced commit.
+    pub staged: bool,
 }
 
 /// What the graph was built from; when it is unchanged, the graph is still current.
@@ -129,6 +131,9 @@ pub struct GraphKey {
     /// same commit changes only this, and the labels must still move.
     pub head_ref: Option<String>,
     pub refs: Vec<(String, ObjectId)>,
+    /// The private tip the last sync covered (from the staging records). Changes the graph
+    /// even though no ref moved: the staged state of every row would otherwise stay stale.
+    pub staged_upto: Option<ObjectId>,
 }
 
 fn head_ref(repo: &gix::Repository, path: &Path) -> Result<Option<String>, GitError> {
@@ -152,6 +157,8 @@ pub struct Graph {
     branched: HashMap<u32, Vec<BranchPoint>>,
     head_row: Option<u32>,
     dim: Option<Vec<bool>>,
+    /// Whether each row's commit is on the public side (an ancestor of the last synced commit).
+    staged: Vec<bool>,
     all_refs: Vec<RefLabel>,
 }
 
@@ -244,7 +251,14 @@ fn read_refs(repo: &gix::Repository, path: &Path) -> Result<Vec<RefTarget>, GitE
 }
 
 /// The refs and HEAD the graph depends on, read without walking any history.
-pub fn current_key(path: &Path, options: &GraphOptions) -> Result<GraphKey, GitError> {
+///
+/// `staged_upto` is the commit the last sync covered, resolved by the caller (the records live
+/// in the project's private repository, which is not necessarily the repository being graphed).
+pub fn current_key(
+    path: &Path,
+    options: &GraphOptions,
+    staged_upto: Option<ObjectId>,
+) -> Result<GraphKey, GitError> {
     let repo = open(path)?;
     let refs = read_refs(&repo, path)?;
     Ok(GraphKey {
@@ -252,6 +266,7 @@ pub fn current_key(path: &Path, options: &GraphOptions) -> Result<GraphKey, GitE
         head: repo.head_id().ok().map(|i| i.detach()),
         head_ref: head_ref(&repo, path)?,
         refs: refs.into_iter().map(|r| (r.label.full, r.commit)).collect(),
+        staged_upto,
     })
 }
 
@@ -337,7 +352,12 @@ fn main_chain(
 }
 
 /// Build the graph. Unknown ref names in `options` are an error.
-pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Graph, GitError> {
+pub fn build(
+    path: &Path,
+    options: &GraphOptions,
+    generation: u64,
+    staged_upto: Option<ObjectId>,
+) -> Result<Graph, GitError> {
     let mut repo = open(path)?;
     repo.object_cache_size_if_unset(32 * 1024 * 1024);
     let refs = read_refs(&repo, path)?;
@@ -472,6 +492,32 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
         })
         .collect();
 
+    // Which commits are on the public side: the ancestors of the last synced commit (or, when
+    // there is no such commit, no commit at all). Ancestors outside the walk are dropped with
+    // the parent links that leave the walk.
+    let staged: Vec<bool> = match staged_upto {
+        Some(upto) => {
+            let mut marked = vec![false; n];
+            if let Some(&w) = walk_index.get(&upto) {
+                let start = row_of[w as usize] as usize;
+                let mut stack = vec![start];
+                marked[start] = true;
+                while let Some(r) = stack.pop() {
+                    let ps = &parents[parent_start[r] as usize..parent_start[r + 1] as usize];
+                    for &p in ps {
+                        let p = p as usize;
+                        if !marked[p] {
+                            marked[p] = true;
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
+            marked
+        }
+        None => vec![false; n],
+    };
+
     let mut graph = Graph {
         generation,
         key: GraphKey {
@@ -482,6 +528,7 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
                 .iter()
                 .map(|r| (r.label.full.clone(), r.commit))
                 .collect(),
+            staged_upto,
         },
         path: path.to_path_buf(),
         head_row: head.and_then(|h| index.get(&h).copied()),
@@ -494,6 +541,7 @@ pub fn build(path: &Path, options: &GraphOptions, generation: u64) -> Result<Gra
         labels,
         branched,
         dim: None,
+        staged,
         all_refs: refs.into_iter().map(|r| r.label).collect(),
     };
     if let Some(tip) = highlight {
@@ -712,6 +760,7 @@ impl Graph {
                     author_email,
                     author_time,
                     dim: self.dim.as_ref().is_some_and(|d| d[r]),
+                    staged: self.staged[r],
                 }
             })
             .collect())

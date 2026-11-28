@@ -7,4 +7,8 @@ export type Settings = {
 /**
  * Theme id: `dark`, `light`, or the file name (without `.json`) of a user theme.
  */
-theme: string, };
+theme: string, 
+/**
+ * Take a backup before dangerous and auto-backup actions (restored by the undo flow).
+ */
+backups: boolean, };

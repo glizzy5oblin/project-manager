@@ -7,6 +7,7 @@
     import type { CommitDetail } from "../bindings/CommitDetail";
     import type { FileStatus } from "../bindings/FileStatus";
     import type { RefLabel } from "../bindings/RefLabel";
+    import type { RepoSide } from "../bindings/RepoSide";
     import { formatOffset, formatTime, shortId } from "../history";
     import type { HeadState } from "../bindings/HeadState";
     import BlameView from "./BlameView.svelte";
@@ -17,6 +18,7 @@
 
     let {
         projectId,
+        side = "private",
         commit,
         refs,
         head,
@@ -26,6 +28,8 @@
         onclose,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project this commit belongs to. */
+        side?: RepoSide;
         commit: string;
         refs: RefLabel[];
         /** The repository's HEAD, for the write actions. */
@@ -52,10 +56,10 @@
     });
 
     $effect(() => {
-        const [p, c, par] = [projectId, commit, parent];
+        const [p, c, par, s] = [projectId, commit, parent, side];
         const mine = ++request;
         error = null;
-        api.commitDetail(p, c, par).then(
+        api.commitDetail(p, c, par, s).then(
             (d) => {
                 if (mine !== request) return;
                 const keep = file && d.files.find((f) => f.path === file?.path);
@@ -95,7 +99,9 @@
     let infoPxH = $state(0);
     // The details never get narrower than their label column and text need, nor does the diff.
     const INFO_MIN = 480;
-    const VIEW_MIN = 320;
+    // A size the user dragged to may go well below that: the details scroll when they are cut.
+    const INFO_DRAG_MIN = 220;
+    const VIEW_MIN = 240;
     let infoW = $state<number | null>(null);
     // The details widen by themselves when a button row or text field would be cut off. This is
     // the width the content asked for; the 480px minimum stays as the floor.
@@ -153,7 +159,7 @@
         bind:clientHeight={layoutH}
         style:--info={infoW === null
             ? `clamp(${infoMin}px, 42%, 32rem)`
-            : `clamp(${infoMin}px, ${infoW * 100}%, calc(100% - ${VIEW_MIN}px))`}
+            : `clamp(${INFO_DRAG_MIN}px, ${infoW * 100}%, calc(100% - ${VIEW_MIN}px))`}
     >
         <div
             class="info"
@@ -212,7 +218,13 @@
                         <dd>{refs.map((r) => r.name).join(", ")}</dd>
                     {/if}
                 </dl>
-                <CommitActions {projectId} commit={detail.id} {refs} {head} />
+                <CommitActions
+                    {projectId}
+                    {side}
+                    commit={detail.id}
+                    {refs}
+                    {head}
+                />
                 {#if detail.parents.length > 1}
                     <label class="compare">
                         Compare with
@@ -285,8 +297,8 @@
             bind:value={infoW}
             current={layoutW ? infoPxW / layoutW : 0.4}
             min={0.15}
-            max={0.75}
-            minPx={infoMin}
+            max={0.9}
+            minPx={INFO_DRAG_MIN}
             endMinPx={VIEW_MIN}
             label="Resize the commit details"
             storageKey="commit.info"
@@ -341,6 +353,7 @@
                 {#if tab === "blame" && file.status !== "deleted"}
                     <BlameView
                         {projectId}
+                        {side}
                         commit={detail.id}
                         path={file.path}
                         {onjump}
@@ -348,6 +361,7 @@
                 {:else}
                     <DiffView
                         {projectId}
+                        {side}
                         commit={detail.id}
                         parent={detail.comparedParent}
                         {file}

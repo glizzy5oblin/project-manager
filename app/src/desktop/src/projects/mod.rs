@@ -1,8 +1,10 @@
 //! The hub's project registry and what the hub shows for each project.
 //!
 //! The registry is a JSON file in the app data folder listing the projects the user added. A
-//! project is a git repository with exactly one `.proj` file at its root. Removing a project
-//! only forgets it; files are never deleted.
+//! project is rooted at the folder holding its `.proj` file. In single-repo mode the repository
+//! is that folder. In two-repo mode the private repository lives in a `private/` child, and the
+//! public repository (a `public/` child) in a sibling, with the `.proj` at the shared root.
+//! Removing a project only forgets it; files are never deleted.
 
 mod create;
 mod store;
@@ -13,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub use create::{clone_project, create_project, name_from_url, validate_project_name};
-pub use store::{ProjectView, Session, Settings, TabState, read_json, write_json};
+pub use store::{ProjectView, RepoSide, Session, Settings, TabState, read_json, write_json};
 
 use crate::git::state::{Operation, read_state};
 use crate::ipc::{AppError, ErrorKind};
@@ -26,7 +28,7 @@ pub struct ProjectEntry {
     pub id: String,
     /// `project.name` from the `.proj` file when it was last read.
     pub name: String,
-    /// Repository root (where the `.proj` file is), canonical.
+    /// Project root (where the `.proj` file is), canonical.
     #[ts(type = "string")]
     pub path: PathBuf,
     /// Unix seconds.
@@ -68,10 +70,12 @@ impl Registry {
             .ok_or_else(|| AppError::not_found(format!("No project with id {id:?}")))
     }
 
-    /// Register the repository at `root`. A folder laid out the way [`create_project`] makes
-    /// projects (`<name>/private` and `<name>/public`) means its `private` repository. With
-    /// `create` set and no `.proj` file present, a starter `.proj` file for that workflow mode is
-    /// written first. Adding a folder that is already registered returns the existing entry.
+    /// Register the project at `root`. The project is rooted at the folder holding the
+    /// `.proj` file — a `<name>/<name>.proj` layout whose repositories (`private/` and, in
+    /// two-repo mode, `public/`) live beside it, or a legacy layout with the `.proj` inside the
+    /// private repository. With `create` set and no `.proj` file present, a starter `.proj`
+    /// file for that workflow mode is written first. Adding a folder that is already
+    /// registered returns the existing entry.
     pub fn add(
         &mut self,
         root: &Path,
@@ -82,12 +86,13 @@ impl Registry {
         if let Some(existing) = self.data.projects.iter().find(|p| p.path == root) {
             return Ok(existing.clone());
         }
-        let proj = match inspect(&root) {
+        let proj = match load_proj(&root) {
             Err(e) if e.kind == ErrorKind::NoProjFile && create.is_some() => {
                 write_starter_proj(&root, create.unwrap_or(WorkflowMode::TwoRepo))?
             }
             other => other?,
         };
+        ensure_repo(&crate::proj::private_root(&root, &proj)?)?;
         self.data.next_id += 1;
         let entry = ProjectEntry {
             id: format!("p{}", self.data.next_id),
@@ -162,33 +167,46 @@ pub(crate) fn dunce_simplified(p: PathBuf) -> PathBuf {
     p
 }
 
-/// A folder that is itself a repository is the project. One that is not, but holds a `private`
-/// repository (the layout [`create_project`] makes), stands for that repository. Only a real
+/// The folder the project is rooted at: the folder that holds the `.proj` file.
+///
+/// The project file lives at the project root (the `<name>/<name>.proj` layout), so the
+/// selected folder is the answer when it has one. A folder that is not the root, but holds a
+/// `private` repository the way [`create_project`] makes projects (the legacy
+/// `<name>/private/<name>.proj` layout), stands for that `private` folder. Only a real
 /// folder counts, not a symlink, so the project never ends up outside the folder picked.
+///
+/// Only a `.proj` file decides: a folder with one IS the project folder, and that is what
+/// lets a project root (the parent folder holding `private/` and `public/`) stand for the
+/// project while its repositories are children.
 fn project_root(root: PathBuf) -> PathBuf {
-    let is_repo = |p: &Path| crate::git::state::open(p).is_ok();
-    if is_repo(&root) {
+    if find_proj_file(&root).is_ok() {
         return root;
     }
     let private = root.join("private");
-    if real_dir(&private) && is_repo(&private) {
-        private
-    } else {
-        root
+    if real_dir(&private) && find_proj_file(&private).is_ok() {
+        return private;
     }
+    root
 }
 
 fn real_dir(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
-/// Check that `root` is a non-bare git repository root holding one valid `.proj` file.
-pub fn inspect(root: &Path) -> Result<ProjFile, AppError> {
-    match crate::git::state::open(root) {
+/// Load the `.proj` file from `root` (the folder that holds it) and return the parsed,
+/// validated project. No repository check: a two-repo project's root holds no repository.
+pub fn load_proj(root: &Path) -> Result<ProjFile, AppError> {
+    let file = find_proj_file(root)?;
+    Ok(ProjFile::load(&file)?)
+}
+
+/// Check that `path` is a non-bare git repository root (has a working tree).
+pub fn ensure_repo(path: &Path) -> Result<(), AppError> {
+    match crate::git::state::open(path) {
         Ok(repo) if repo.workdir().is_none() => {
             return Err(AppError::invalid(format!(
                 "{} is a bare repository; pick a folder with a working tree",
-                root.display()
+                path.display()
             )));
         }
         Ok(_) => {}
@@ -197,21 +215,44 @@ pub fn inspect(root: &Path) -> Result<ProjFile, AppError> {
                 ErrorKind::NotARepo,
                 format!(
                     "{} is not the top folder of a git repository",
-                    root.display()
+                    path.display()
                 ),
             )
             .with_detail(e.to_string()));
         }
     }
-    let file = find_proj_file(root)?;
-    Ok(ProjFile::load(&file)?)
+    Ok(())
 }
 
-/// Write `<folder>.proj` for an existing repository. Never overwrites a file. In the
-/// `<name>/private` layout the project is called `<name>`, and its public repository is
-/// `../public` when that folder exists.
+/// Write `<name>.proj` for an existing project folder. Never overwrites a file.
+///
+/// In the `<name>/private` + `<name>/public` layout the proj goes at the project folder
+/// and both sides are named inside it. The legacy layout (the root is the private repository
+/// itself, `<name>/private`) keeps the proj there and points the public side at the sibling
+/// `public` repo when that folder exists.
 fn write_starter_proj(root: &Path, mode: WorkflowMode) -> Result<ProjFile, AppError> {
     let file_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let name_of = |p: &Path| {
+        let folder = file_name(p).unwrap_or_else(|| "project".into());
+        if validate_project_name(&folder).is_ok() {
+            folder
+        } else {
+            "project".to_string()
+        }
+    };
+    if real_dir(&root.join("private")) {
+        // The project folder: the `.proj` lives here, beside its repositories.
+        let name = name_of(root);
+        let (private_path, public_path) = match mode {
+            WorkflowMode::TwoRepo => (
+                Some("./private"),
+                real_dir(&root.join("public")).then_some("./public"),
+            ),
+            WorkflowMode::SingleRepo => (None, None),
+        };
+        return write_new_proj(root, &name, mode, private_path, public_path);
+    }
+    // The legacy layout: the root is the private repository itself.
     let split = file_name(root).as_deref() == Some("private");
     let folder = if split {
         root.parent().and_then(file_name)
@@ -224,27 +265,40 @@ fn write_starter_proj(root: &Path, mode: WorkflowMode) -> Result<ProjFile, AppEr
     } else {
         "project".to_string()
     };
-    let sibling = root.parent().map(|p| p.join("public"));
-    let public = if split && sibling.as_deref().is_some_and(real_dir) {
-        "../public".to_string()
-    } else {
-        format!("../{name}-public")
+    let (private_path, public_path) = match mode {
+        WorkflowMode::TwoRepo => {
+            let sibling = root.parent().map(|p| p.join("public"));
+            let public = if split && sibling.as_deref().is_some_and(real_dir) {
+                "../public".into()
+            } else {
+                format!("../{name}-public")
+            };
+            (Some("."), Some(public))
+        }
+        WorkflowMode::SingleRepo => (None, None),
     };
-    write_new_proj(root, &name, mode, &public)
+    write_new_proj(root, &name, mode, private_path, public_path.as_deref())
 }
 
-/// Write a starter `.proj` for `name` into `root`, with `public_path` as the public repo path in
-/// two-repo mode.
+/// Write a starter `.proj` for `name` into `root` (the folder the project is rooted at).
+/// In two-repo mode the public repo path is written either from the caller or (when the public
+/// repo is the conventional beside-the-private sibling) as `./public`.
 pub(crate) fn write_new_proj(
     root: &Path,
     name: &str,
     mode: WorkflowMode,
-    public_path: &str,
+    private_path: Option<&str>,
+    public_path: Option<&str>,
 ) -> Result<ProjFile, AppError> {
     let path = root.join(format!("{name}.{PROJ_EXTENSION}"));
     let mut doc = ProjDocument::parse(&ProjFile::template(name, mode))?;
-    if mode == WorkflowMode::TwoRepo {
-        doc.set_string(&["workflow", "public", "path"], public_path);
+    if let Some(p) = private_path {
+        doc.set_string(&["workflow", "private", "path"], p);
+    }
+    if mode == WorkflowMode::TwoRepo
+        && let Some(p) = public_path
+    {
+        doc.set_string(&["workflow", "public", "path"], p);
     }
     let proj = doc.to_proj()?;
     // create_new: refuse to replace a file that appeared meanwhile.
@@ -320,15 +374,27 @@ pub fn summarize(entry: &ProjectEntry) -> ProjectSummary {
         )));
         return s;
     }
-    match find_proj_file(&entry.path).and_then(|f| ProjFile::load(&f)) {
+    // The private repo is what the hub reads (branch, status, tags); the proj lives at the
+    // project root. Fall back to the project root when the proj is unreadable.
+    let loaded = find_proj_file(&entry.path).and_then(|f| ProjFile::load(&f));
+    let private = match &loaded {
+        Ok(proj) => {
+            crate::proj::private_root(&entry.path, proj).unwrap_or_else(|_| entry.path.clone())
+        }
+        Err(_) => entry.path.clone(),
+    };
+    match loaded {
         Ok(p) => {
+            let public_tag = public_release_tag(&entry.path, &p);
             s.name = p.project.name;
             s.version = Some(p.project.version);
             s.mode = Some(p.workflow.mode);
+            // Releases live on the public side; the private tags are only the fallback.
+            s.last_release = public_tag;
         }
         Err(e) => s.proj_error = Some(e.into()),
     }
-    match read_state(&entry.path, true) {
+    match read_state(&private, true) {
         Ok(state) => {
             s.trusted = state.trusted;
             s.branch = state.head.branch.clone();
@@ -346,11 +412,34 @@ pub fn summarize(entry: &ProjectEntry) -> ProjectSummary {
                 s.conflicted = n(st.conflicted.len());
             }
             s.in_progress = state.in_progress;
-            s.last_release = last_release(state.tags.iter().map(|t| t.name.as_str()));
+            if s.last_release.is_none() {
+                s.last_release = last_release(state.tags.iter().map(|t| t.name.as_str()));
+            }
         }
         Err(e) => s.repo_error = Some(e.into()),
     }
     s
+}
+
+/// The latest release tag from the public side: in two-repo mode the highest release tag of
+/// the separate public repository; in single-repo mode the highest one reachable from the
+/// public branch (a release tag sits on the public branch). `None` when the public side
+/// cannot be read, so the caller falls back to the private tags.
+fn public_release_tag(root: &Path, proj: &ProjFile) -> Option<String> {
+    let out = match proj.workflow.mode {
+        WorkflowMode::TwoRepo => {
+            let rel = proj.workflow.public.path.as_deref()?;
+            crate::git::GitCommand::new(root.join(rel))
+                .args(["tag", "--list"])
+                .run()
+                .ok()?
+        }
+        WorkflowMode::SingleRepo => crate::git::GitCommand::new(root)
+            .args(["tag", "--merged", &proj.workflow.public.branch])
+            .run()
+            .ok()?,
+    };
+    last_release(out.stdout_str().lines())
 }
 
 /// The highest tag that is a release version (`v1.2.3` or `1.2.3`, pre-releases included).

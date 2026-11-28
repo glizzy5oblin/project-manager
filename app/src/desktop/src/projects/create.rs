@@ -85,9 +85,11 @@ fn parent_dir(parent: &Path) -> Result<PathBuf, AppError> {
     Ok(super::dunce_simplified(p))
 }
 
-/// Create the project folder `<parent>/<name>` holding the private repository `private/` with a
-/// starter `<name>.proj`. In two-repo mode the public repository `public/` is created beside it.
-/// Returns the project root (the private repository). Nothing is left behind on failure.
+/// Create the project folder `<parent>/<name>` holding the `<name>.proj`, a private repository
+/// beside it (the project folder IS the repo root in single-repo mode; in two-repo mode the
+/// private repository lives in `private/`). In two-repo mode the public repository `public/`
+/// is created beside it. Returns the project root (the folder holding the `.proj`).
+/// Nothing is left behind on failure.
 pub fn create_project(parent: &Path, name: &str, mode: WorkflowMode) -> Result<PathBuf, AppError> {
     validate_project_name(name)?;
     let parent = parent_dir(parent)?;
@@ -98,22 +100,32 @@ pub fn create_project(parent: &Path, name: &str, mode: WorkflowMode) -> Result<P
     std::fs::create_dir(&folder).map_err(|e| AppError::io(&folder, &e))?;
     let cleanup = Cleanup(vec![folder.clone()]);
 
-    let root = folder.join("private");
-    let public = folder.join("public");
-    for dir in std::iter::once(&root).chain((mode == WorkflowMode::TwoRepo).then_some(&public)) {
-        std::fs::create_dir(dir).map_err(|e| AppError::io(dir, &e))?;
-        GitCommand::new(dir)
-            .args(["init", "-q", "-b", "main"])
-            .run()?;
+    match mode {
+        WorkflowMode::SingleRepo => {
+            GitCommand::new(&folder)
+                .args(["init", "-q", "-b", "main"])
+                .run()?;
+            super::write_new_proj(&folder, name, mode, None, None)?;
+        }
+        WorkflowMode::TwoRepo => {
+            let root = folder.join("private");
+            let public = folder.join("public");
+            for dir in std::iter::once(&root).chain(std::iter::once(&public)) {
+                std::fs::create_dir(dir).map_err(|e| AppError::io(dir, &e))?;
+                GitCommand::new(dir)
+                    .args(["init", "-q", "-b", "main"])
+                    .run()?;
+            }
+            super::write_new_proj(&folder, name, mode, Some("./private"), Some("./public"))?;
+        }
     }
-    super::write_new_proj(&root, name, mode, "../public")?;
     cleanup.disarm();
-    Ok(root)
+    Ok(folder)
 }
 
 /// Clone `url` into `<parent>/<name>` (name defaults to the one in the URL), reporting progress
-/// through the task. Returns the new repository root. A failed or cancelled clone leaves no
-/// folder behind.
+/// through the task. Returns the new project root (the folder holding the `.proj` file). A
+/// failed or cancelled clone leaves no folder behind.
 pub fn clone_project(
     url: &str,
     parent: &Path,

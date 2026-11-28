@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 
 use super::{CURRENT_SCHEMA_VERSION, ProjError, ProjFile, write_atomic};
 
@@ -115,6 +115,40 @@ impl ProjDocument {
         table.remove(last).is_some()
     }
 
+    /// Append one `[[release.history]]` entry. Returns whether a new entry was added; a tag
+    /// which is already recorded is skipped (idempotent).
+    pub fn push_release_history(&mut self, tag: &str, version: &str, date: &str) -> bool {
+        let already_recorded = self
+            .doc
+            .get("release")
+            .and_then(Item::as_table)
+            .and_then(|table| table.get("history"))
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.get("tag").and_then(Item::as_str) == Some(tag))
+            });
+        if already_recorded {
+            return false;
+        }
+        self.doc
+            .entry("release")
+            .or_insert_with(|| Item::Table(Table::new()));
+        let release = self
+            .doc
+            .get_mut("release")
+            .and_then(Item::as_table_mut)
+            .unwrap();
+        let mut entries: ArrayOfTables = match release.get("history") {
+            Some(Item::ArrayOfTables(a)) => a.iter().cloned().collect(),
+            _ => ArrayOfTables::new(),
+        };
+        entries.push(history_entry(tag, version, date));
+        release.insert("history", Item::ArrayOfTables(entries));
+        true
+    }
+
     /// Set a value at a dotted path, creating tables as needed. An existing value keeps its
     /// surrounding comments and spacing.
     pub fn set(&mut self, path: &[&str], mut value: Value) {
@@ -149,6 +183,15 @@ impl ProjDocument {
     }
 }
 
+/// One `[[release.history]]` entry as a table.
+fn history_entry(tag: &str, version: &str, date: &str) -> Table {
+    let mut entry = Table::new();
+    entry.insert("tag", Item::Value(Value::from(tag)));
+    entry.insert("version", Item::Value(Value::from(version)));
+    entry.insert("date", Item::Value(Value::from(date)));
+    entry
+}
+
 impl std::fmt::Display for ProjDocument {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.doc)
@@ -176,4 +219,60 @@ pub fn migrate(doc: &mut ProjDocument) -> Result<bool, ProjError> {
         Value::from(i64::from(CURRENT_SCHEMA_VERSION)),
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(text: &str) -> ProjDocument {
+        ProjDocument::parse(text).unwrap()
+    }
+
+    const MINIMAL: &str = r#"schema_version = 1
+
+[project]
+name = "Example"
+version = "1.2.3"
+
+[workflow]
+mode = "single-repo"
+
+[workflow.private]
+branch = "main"
+
+[workflow.public]
+branch = "public"
+"#;
+
+    #[test]
+    fn push_release_history_appends_an_entry_and_is_idempotent() {
+        let mut d = doc(&format!("{MINIMAL}\n[release]\nversion_files = []\n"));
+        let added = d.push_release_history("v1.2.3", "1.2.3", "2020-01-01");
+        assert!(added);
+        // A second record of the same tag is a no-op.
+        let added = d.push_release_history("v1.2.3", "1.2.3", "2020-01-02");
+        assert!(!added);
+        // A different tag appends.
+        let added = d.push_release_history("v1.2.4", "1.2.4", "2020-01-03");
+        assert!(added);
+
+        let proj = d.to_proj().unwrap();
+        assert_eq!(proj.release.history.len(), 2);
+        assert_eq!(proj.release.history[0].tag, "v1.2.3");
+        assert_eq!(proj.release.history[0].version, "1.2.3");
+        assert_eq!(proj.release.history[0].date, "2020-01-01");
+        assert_eq!(proj.release.history[1].tag, "v1.2.4");
+        assert_eq!(proj.release.history[1].date, "2020-01-03");
+    }
+
+    #[test]
+    fn push_release_history_creates_the_release_table_when_missing() {
+        let mut d = doc(MINIMAL);
+        let added = d.push_release_history("v1.2.3", "1.2.3", "2020-01-01");
+        assert!(added);
+        let proj = d.to_proj().unwrap();
+        assert_eq!(proj.release.history.len(), 1);
+        assert_eq!(proj.release.history[0].tag, "v1.2.3");
+    }
 }

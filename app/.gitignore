@@ -9,3 +9,6 @@ src/desktop/gen/
 !.vscode/extensions.json
 .idea
 .DS_Store
+
+# ts-rs output when cargo runs without .cargo/config.toml (real bindings: src/ui/lib/bindings)
+src/desktop/bindings/

@@ -200,6 +200,59 @@ impl From<UrlError> for AppError {
     }
 }
 
+impl From<crate::staging::StagingError> for AppError {
+    fn from(e: crate::staging::StagingError) -> Self {
+        let message = e.to_string();
+        match e {
+            crate::staging::StagingError::Proj(p) => p.into(),
+            crate::staging::StagingError::Git(g) => g.into(),
+            crate::staging::StagingError::Io { path, source } => AppError::io(&path, &source),
+            crate::staging::StagingError::PublicDirty(_)
+            | crate::staging::StagingError::PublicCommit(_) => {
+                AppError::new(ErrorKind::Stale, message)
+            }
+            crate::staging::StagingError::NotFound(_) => {
+                AppError::new(ErrorKind::NotFound, message)
+            }
+        }
+    }
+}
+
+impl From<crate::release::TagError> for AppError {
+    fn from(e: crate::release::TagError) -> Self {
+        use crate::release::TagError as T;
+        let message = e.to_string();
+        match e {
+            T::Proj(p) => p.into(),
+            T::Git(g) => g.into(),
+            T::WrongBranch { .. } | T::DirtyTree | T::TagExists(_) | T::CurrentNotSemver(_) => {
+                AppError::invalid(message)
+            }
+        }
+    }
+}
+
+impl From<crate::release::ReleaseError> for AppError {
+    fn from(e: crate::release::ReleaseError) -> Self {
+        use crate::release::ReleaseError as R;
+        let message = e.to_string();
+        match e {
+            R::Proj(p) => p.into(),
+            R::Io { path, source } => AppError::io(&path, &source),
+            R::VersionFileMissing { .. } => AppError::new(ErrorKind::NotFound, message),
+            R::CurrentNotSemver(_)
+            | R::ExactNotSemver(_)
+            | R::NotNewer { .. }
+            | R::MissingExact
+            | R::VersionFileWithoutCurrent { .. }
+            | R::MissingPublicPath => AppError::invalid(message),
+            R::Git(g) => g.into(),
+            R::GitHub(g) => g.into(),
+            R::Zip(_) | R::Manifest(_) => AppError::invalid(message),
+        }
+    }
+}
+
 impl From<GitHubError> for AppError {
     fn from(e: GitHubError) -> Self {
         let message = e.to_string();

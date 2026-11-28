@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import type { Session } from "./bindings/Session";
-import { closeTab, cycle, moveTab, openTab, pruneTabs, setView } from "./tabs";
+import {
+    closeTab,
+    cycle,
+    moveTab,
+    openTab,
+    pruneTabs,
+    setSide,
+    setView,
+} from "./tabs";
 
 const tabs = (...ids: string[]): Session => ({
-    tabs: ids.map((projectId) => ({ projectId, view: "overview" })),
+    tabs: ids.map((projectId) => ({
+        projectId,
+        view: "overview",
+        side: "private",
+    })),
     active: null,
 });
 const order = (s: Session) => s.tabs.map((t) => t.projectId);
@@ -55,6 +67,13 @@ describe("tabs", () => {
     it("keeps a view per tab", () => {
         const s = setView(tabs("a", "b"), "b", "graph");
         expect(s.tabs.map((t) => t.view)).toEqual(["overview", "graph"]);
+    });
+
+    it("opens tabs on the private side and keeps a side per tab", () => {
+        const opened = openTab(tabs(), "a");
+        expect(opened.tabs.map((t) => t.side)).toEqual(["private"]);
+        const s = setSide(tabs("a", "b"), "b", "public");
+        expect(s.tabs.map((t) => t.side)).toEqual(["private", "public"]);
     });
 
     it("prunes tabs of removed projects", () => {

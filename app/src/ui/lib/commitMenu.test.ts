@@ -31,12 +31,15 @@ const ids = (m: ReturnType<typeof commitMenu>) =>
     m.items.filter((i) => !i.separator).map((i) => i.id);
 
 describe("commitMenu", () => {
-    it("on a plain commit: new branch, resets, and copying", () => {
+    it("on a plain commit: new branch, resets, cherry-pick, revert, and copying", () => {
         expect(ids(menu())).toEqual([
             "new-branch",
             "reset-soft",
             "reset-mixed",
             "reset-hard",
+            "cherry-pick",
+            "revert",
+            "edit-from",
             "copy-id",
             "copy-subject",
         ]);
@@ -53,10 +56,13 @@ describe("commitMenu", () => {
             "reset-soft",
             "reset-mixed",
             "reset-hard",
+            "cherry-pick",
             "checkout:main",
             "merge:main",
+            "rebase:main",
             "delete:main",
             "merge:dev",
+            "rebase:dev",
         ]);
         for (const i of off) expect(i.hint, i.id).toBeTruthy();
         expect(m.items.find((i) => i.id === "checkout:dev")?.disabled).toBe(
@@ -89,11 +95,66 @@ describe("commitMenu", () => {
         expect(detached?.hint).toContain("Check out a branch");
     });
 
-    it("marks only the hard reset as dangerous", () => {
-        const danger = menu()
+    it("marks the hard reset, rebases and deletes as dangerous", () => {
+        const danger = menu({ refs: [ref("dev", "branch")] })
             .items.filter((i) => i.danger)
             .map((i) => i.id);
-        expect(danger).toEqual(["reset-hard"]);
+        expect(danger).toEqual([
+            "reset-hard",
+            "edit-from",
+            "rebase:dev",
+            "delete:dev",
+        ]);
+    });
+
+    it("cherry-picks and reverts the commit, and rebases onto a branch", () => {
+        const commit = "c".repeat(40);
+        const m = menu({
+            refs: [ref("dev", "branch"), ref("o/dev", "remote")],
+        });
+        expect(m.commands["cherry-pick"]).toEqual({
+            type: "action",
+            action: { type: "cherryPick", commit },
+        });
+        expect(m.commands["revert"]).toEqual({
+            type: "action",
+            action: { type: "revert", commit },
+        });
+        expect(m.commands["rebase:o/dev"]).toEqual({
+            type: "action",
+            action: { type: "rebase", onto: "o/dev" },
+        });
+        const detached = menu({
+            refs: [ref("dev", "branch")],
+            head: head(null, "a".repeat(40)),
+        });
+        const rebase = detached.items.find((i) => i.id === "rebase:dev");
+        expect(rebase?.disabled).toBe(true);
+        expect(rebase?.hint).toContain("Check out a branch");
+        const empty = menu({ head: null });
+        for (const id of ["cherry-pick", "revert"])
+            expect(empty.items.find((i) => i.id === id)?.disabled, id).toBe(
+                true,
+            );
+    });
+
+    it("opens the commit editor from a commit on a branch, but not a merge", () => {
+        const m = menu();
+        expect(m.commands["edit-from"]).toEqual({ type: "edit" });
+        const item = (m: ReturnType<typeof commitMenu>) =>
+            m.items.find((i) => i.id === "edit-from");
+        expect(item(m)?.label).toBe("Edit main commits from here…");
+        expect(item(m)?.disabled).toBe(false);
+        expect(item(m)?.hint).toContain("backup");
+        // HEAD's own commit can be edited on its own.
+        expect(item(menu({ commit: "a".repeat(40) }))?.disabled).toBe(false);
+        const merge = item(menu({ parents: ["1".repeat(40), "2".repeat(40)] }));
+        expect(merge?.disabled).toBe(true);
+        expect(merge?.hint).toContain("merge commit");
+        const detached = item(menu({ head: head(null, "a".repeat(40)) }));
+        expect(detached?.disabled).toBe(true);
+        expect(detached?.hint).toContain("Check out a branch");
+        expect(item(menu({ head: null }))?.disabled).toBe(true);
     });
 
     it("disables write items while an action runs, but not copying", () => {

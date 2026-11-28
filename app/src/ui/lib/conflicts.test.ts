@@ -11,6 +11,8 @@ const info = (over: Partial<ConflictInfo> = {}): ConflictInfo => ({
     regions: [],
     moreRegions: false,
     text: null,
+    during: "merge",
+    swapped: false,
     ...over,
 });
 
@@ -74,9 +76,27 @@ describe("steps and regions", () => {
         ] as const)
             expect(steps(info({ kind })).at(-1)).toContain("Abort merge");
     });
+
+    it("finishes a cherry-pick, revert or rebase with Continue", () => {
+        for (const [during, abort] of [
+            ["cherryPick", "Abort cherry-pick"],
+            ["revert", "Abort revert"],
+            ["rebase", "Abort rebase"],
+        ] as const) {
+            const last = steps(info({ during })).at(-1) ?? "";
+            expect(last).toContain("Continue");
+            expect(last).toContain(abort);
+        }
+    });
 });
 
-import { findRegions, resolveRegion, withLineEnds } from "./conflicts";
+import {
+    findRegions,
+    resolveRegion,
+    textChoice,
+    withLineEnds,
+    yourRegions,
+} from "./conflicts";
 
 const two =
     "a\n<<<<<<< HEAD\nmine1\n=======\ntheirs1\n>>>>>>> other\nb\n<<<<<<< HEAD\nmine2\n||||||| base\nold\n=======\ntheirs2\n>>>>>>> other\nc\n";
@@ -114,5 +134,33 @@ describe("editing the text", () => {
             findRegions("<<<<<<< x\r\na\r\n=======\r\nb\r\n>>>>>>> y\r\n")
                 .length,
         ).toBe(1);
+    });
+});
+
+describe("during a rebase, your lines are the second ones in the file", () => {
+    // git writes the branch being rebased onto first and your commit second.
+    const text = "<<<<<<< HEAD\nonto\n=======\nyours\n>>>>>>> abc (mine)\n";
+
+    it("shows your lines as yours", () => {
+        expect(yourRegions(text, true)[0]).toMatchObject({
+            ours: ["yours"],
+            theirs: ["onto"],
+        });
+        expect(yourRegions(text, false)[0]).toMatchObject({
+            ours: ["onto"],
+            theirs: ["yours"],
+        });
+    });
+
+    it("keeps your lines when you press Keep mine", () => {
+        const keep = (c: Parameters<typeof textChoice>[0]) =>
+            resolveRegion(text, 0, textChoice(c, true));
+        expect(keep("ours")).toBe("yours\n");
+        expect(keep("theirs")).toBe("onto\n");
+        expect(keep("both")).toBe("yours\nonto\n");
+        expect(keep("theirsFirst")).toBe("onto\nyours\n");
+        expect(resolveRegion(text, 0, textChoice("ours", false))).toBe(
+            "onto\n",
+        );
     });
 });

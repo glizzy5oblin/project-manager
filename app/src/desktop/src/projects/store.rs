@@ -78,6 +78,17 @@ pub enum ProjectView {
     Settings,
 }
 
+/// Which repository of a two-repo project a tab is showing. In single-repo mode only the
+/// private side exists (the public side is a branch, not a separate repository).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoSide {
+    #[default]
+    Private,
+    Public,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +96,8 @@ pub struct TabState {
     pub project_id: String,
     #[serde(default)]
     pub view: ProjectView,
+    #[serde(default)]
+    pub side: RepoSide,
 }
 
 /// Open project tabs, in order, and which one is showing (`None` for the hub).
@@ -118,12 +131,15 @@ impl Session {
 pub struct Settings {
     /// Theme id: `dark`, `light`, or the file name (without `.json`) of a user theme.
     pub theme: String,
+    /// Take a backup before dangerous and auto-backup actions (restored by the undo flow).
+    pub backups: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: "dark".into(),
+            backups: true,
         }
     }
 }

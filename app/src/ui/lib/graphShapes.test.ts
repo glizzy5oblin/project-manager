@@ -13,6 +13,7 @@ function row(over: Partial<GraphRow> & { row: number }): GraphRow {
         branched: [],
         parents: ["p"],
         dim: false,
+        staged: true,
         ...over,
     } as GraphRow;
 }
@@ -76,6 +77,14 @@ describe("graphShapes", () => {
         expect(shapes([row({ row: 0 })], { headRow: 0 }).nodes[0].ring).toBe(
             "head",
         );
+    });
+
+    it("carries the staged state of each node through the node shape", () => {
+        const s = shapes([
+            row({ row: 0, staged: true }),
+            row({ row: 1, staged: false }),
+        ]);
+        expect(s.nodes.map((n) => n.staged)).toEqual([true, false]);
     });
 
     it("fades dimmed rows and rows outside a search", () => {

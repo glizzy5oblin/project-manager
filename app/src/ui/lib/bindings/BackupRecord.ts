@@ -56,6 +56,10 @@ mergeMode: string | null,
  */
 stashes: Array<StashTip>, 
 /**
+ * Every remote-tracking branch (`origin/main`), kept under `remotes/`. Not restored.
+ */
+remotes: Array<RefTip>, 
+/**
  * The repository uses Git LFS.
  */
 lfs: boolean, bundle: string | null, };

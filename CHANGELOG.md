@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.0.3 - 2026-11-28
+
+Releases from inside the app: stage the private repo into the public one, then version, tag, zip and publish a GitHub release, with a checklist that shows what is left. History editing and remote operations arrive too.
+
+### Releasing
+
+- Staging tab: copies the allowlisted private files to the public side (two-repo or single-repo), with a leak scan that blocks keys, tokens, env files and decompiled code, a per-file diff, and the staged state of each commit in the graph.
+- `[staging.map]` in the `.proj` publishes a private file under another name, such as `publish/Makefile` as the public `Makefile`.
+- Release tab: version bump (`.proj` and configured version files), annotated tag with checks and optional push, release zip with a manifest and SHA-256 checksum, release notes generated from the commits since the last tag (editable), and GitHub release publishing with asset upload.
+- Release checklist and history: every step reports whether it is done, and each tagged release is recorded in the `.proj`.
+
+### History and remotes
+
+- Cherry-pick, revert and rebase, with continue and abort.
+- Interactive rebase: reorder, squash, fixup, drop and reword.
+- Fetch, pull, push, force push with lease, and tag push.
+
+### App
+
+- Preferences dialog, backup settings, and backup retention by count or age with a cleanup preview.
+- Theme editor with save as, import and export; the light theme now meets WCAG AA contrast.
+- Command palette, keyboard focus, reduced motion, and clearer empty and loading states.
+- Error reporting and logging, a diagnostics export, and export/import of the app's data folder.
+- A Guide button and palette command that open the documentation.
+
+### Fixes
+
+- Commits, fetches and pushes made from the AppImage no longer fail or warn: git, gh and git hooks now run with the system's libraries instead of the AppImage's bundled ones.
+- Release notes no longer go empty after the Tag step: once this version's tag is on HEAD, they run from the previous tag.
+- Editing, deleting, uploading the zip to, and replacing the asset on a GitHub release work (they failed with "missing required key releaseId").
+- The commit details panel can be dragged narrower; the danger button label in the sync bar is readable.
+- Security: updated the `cookie` crate (RUSTSEC-2026-0594).
+
+### Builds
+
+- Linux AppImage built in a Debian 12 container; a manual release build for Windows, Linux and macOS in CI, and a public-side check on every push.
+
 ## v0.0.2 - 2026-11-22
 
 Write actions arrive: the app can now change a repository, not only show it. Every risky action takes a restore point first, and Activity can undo it.

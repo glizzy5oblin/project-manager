@@ -1,11 +1,13 @@
 <script lang="ts">
     // The operation log: every git command and backup the app ran, newest first, with the exact
     // command, result and git's error output. Shows this project's entries, or all of them.
+    import { untrack } from "svelte";
     import { listen } from "@tauri-apps/api/event";
     import { api, toAppError } from "../api";
     import type { AppError } from "../bindings/AppError";
     import type { BackupRecord } from "../bindings/BackupRecord";
     import type { ActionOutcome } from "../bindings/ActionOutcome";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { RestorePreview } from "../bindings/RestorePreview";
     import type { OpEntry } from "../bindings/OpEntry";
     import { pathTail } from "../format";
@@ -16,11 +18,14 @@
 
     let {
         projectId,
+        side = "private",
         root,
         active,
         onreload,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project the restore points belong to. */
+        side?: RepoSide;
         /** The project's path, as the log records it. */
         root: string | undefined;
         active: boolean;
@@ -42,10 +47,64 @@
     let restoring = $state(false);
     let notice = $state("");
     let pointsError = $state<AppError | null>(null);
+    let importing = $state<string | null>(null);
+    let deleteArmed = $state<string | null>(null);
+    let cleanup = $state<BackupRecord[] | null>(null);
+    let cleaning = $state(false);
+
+    // A restore preview, cleanup list or armed delete refers to one side's restore points, so drop
+    // them when the side switches; the list itself reloads in the effect below.
+    let seenSide = untrack(() => side);
+    $effect(() => {
+        if (side === seenSide) return;
+        seenSide = side;
+        choosing = null;
+        cleanup = null;
+        deleteArmed = null;
+        notice = "";
+        pointsError = null;
+    });
+
+    async function previewCleanup() {
+        notice = "";
+        pointsError = null;
+        try {
+            cleanup = await api.backupsCleanupPreview(projectId, side);
+        } catch (e) {
+            pointsError = toAppError(e);
+        }
+    }
+
+    async function runCleanup() {
+        if (cleaning) return;
+        cleaning = true;
+        pointsError = null;
+        try {
+            const gone = await api.backupsCleanup(projectId, side);
+            notice = `Cleaned up ${gone.length} old restore point${gone.length === 1 ? "" : "s"}.`;
+            cleanup = null;
+            await loadPoints();
+        } catch (e) {
+            pointsError = toAppError(e);
+        } finally {
+            cleaning = false;
+        }
+    }
+
+    const oldestAge = $derived.by(() => {
+        if (!points.length) return "";
+        const oldest = points[points.length - 1].created;
+        const days = Math.floor((Date.now() / 1000 - oldest) / 86400);
+        return days <= 0
+            ? "today"
+            : days === 1
+              ? "1 day old"
+              : `${days} days old`;
+    });
 
     async function loadPoints() {
         try {
-            points = await api.backupsList(projectId);
+            points = await api.backupsList(projectId, side);
             pointsError = null;
         } catch (e) {
             pointsError = toAppError(e);
@@ -56,7 +115,7 @@
         notice = "";
         pointsError = null;
         try {
-            choosing = await api.backupPreview(projectId, id);
+            choosing = await api.backupPreview(projectId, id, side);
         } catch (e) {
             pointsError = toAppError(e);
         }
@@ -69,7 +128,7 @@
         pointsError = null;
         try {
             const out = await tasks.wait(
-                await api.backupRestore(projectId, id),
+                await api.backupRestore(projectId, id, side),
             );
             if (out.status === "ok") {
                 const o = out.value as ActionOutcome;
@@ -88,6 +147,37 @@
         }
     }
 
+    async function importBundle(id: string) {
+        if (importing) return;
+        importing = id;
+        pointsError = null;
+        notice = "";
+        try {
+            await api.backupsImportBundle(projectId, id, side);
+            notice = `Bundle for ${id} imported — this point can be restored again.`;
+        } catch (e) {
+            pointsError = toAppError(e);
+        } finally {
+            importing = null;
+        }
+    }
+
+    async function deletePoint(id: string) {
+        if (deleteArmed !== id) {
+            deleteArmed = id;
+            return;
+        }
+        deleteArmed = null;
+        pointsError = null;
+        try {
+            await api.backupsDelete(projectId, id, side);
+            if (choosing?.backup.id === id) choosing = null;
+            await loadPoints();
+        } catch (e) {
+            pointsError = toAppError(e);
+        }
+    }
+
     async function load() {
         try {
             entries = await api.opLog();
@@ -102,6 +192,8 @@
             loaded = true;
             void load();
         }
+        // The restore points are per-side; reload them when the side switches too.
+        void side;
         if (active) void loadPoints();
     });
 
@@ -164,9 +256,55 @@
         >
             Clear log
         </button>
+        <button
+            title="Delete restore points that are too many or too old (the count/age limit of the retention policy); your files and branches are not changed"
+            type="button"
+            disabled={points.length === 0 || cleaning}
+            onclick={previewCleanup}
+        >
+            {cleaning ? "Cleaning…" : "Clean up old"}
+        </button>
     </header>
     <section class="points" aria-label="Restore points">
         <h3>Undo: restore points</h3>
+        <p class="muted">
+            {points.length} restore point{points.length === 1 ? "" : "s"}
+            {oldestAge ? `, oldest ${oldestAge}` : ""}.
+        </p>
+        {#if cleanup}
+            <div class="review" role="group" aria-label="Confirm cleanup">
+                <strong>
+                    {cleanup.length} restore point{cleanup.length === 1
+                        ? ""
+                        : "s"} would be deleted:
+                </strong>
+                <ul>
+                    {#each cleanup as b (b.id)}
+                        <li>
+                            {restoreLabel(b.action)} — {formatTime(b.created)}
+                        </li>
+                    {/each}
+                </ul>
+                <div class="buttons">
+                    <button
+                        title="Delete these restore points. Your files and branches are not changed"
+                        type="button"
+                        disabled={cleaning}
+                        onclick={runCleanup}
+                    >
+                        {cleaning ? "Cleaning…" : "Delete"}
+                    </button>
+                    <button
+                        title="Close this without deleting anything"
+                        type="button"
+                        disabled={cleaning}
+                        onclick={() => (cleanup = null)}
+                    >
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        {/if}
         <p class="muted">
             Before it stashes, discards, resets or deletes something, Project
             Manager saves how your project looked. Pick one to put everything
@@ -226,10 +364,32 @@
                         <button
                             title="See what going back to this point would change, then confirm"
                             type="button"
-                            disabled={restoring}
+                            disabled={restoring || importing === b.id}
                             onclick={() => review(b.id)}
                         >
                             Restore…
+                        </button>
+                        {#if b.bundle}
+                            <button
+                                title="Bring this restore point's refs back from its bundle (after they were deleted)"
+                                type="button"
+                                disabled={importing === b.id}
+                                onclick={() => importBundle(b.id)}
+                            >
+                                {importing === b.id
+                                    ? "Importing…"
+                                    : "Import bundle"}
+                            </button>
+                        {/if}
+                        <button
+                            title={deleteArmed === b.id
+                                ? "Click this button again to delete it"
+                                : "Delete this restore point. Your files and branches are not changed"}
+                            type="button"
+                            disabled={restoring || importing === b.id}
+                            onclick={() => deletePoint(b.id)}
+                        >
+                            {deleteArmed === b.id ? "Delete?" : "Delete"}
                         </button>
                     </li>
                 {/each}
@@ -240,6 +400,12 @@
                 is about to happen.
             </p>
         {/if}
+        <p class="muted">
+            Safe actions (stage/unstage, stash push/apply, look at a file) are
+            not restored by restore points — the operation log below shows what
+            ran. Dangerous actions take a restore point first; restore it to
+            undo.
+        </p>
     </section>
     <h3>Log</h3>
     <p class="muted">

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/glizzy5oblin/project-manager"><img alt="Version" src="https://img.shields.io/badge/version-0.0.2-2f6fe4?style=for-the-badge"></a>
+  <a href="https://github.com/glizzy5oblin/project-manager"><img alt="Version" src="https://img.shields.io/badge/version-0.0.3-2f6fe4?style=for-the-badge"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4?style=for-the-badge">
   <a href="https://tauri.app"><img alt="Tauri 2" src="https://img.shields.io/badge/Tauri-2-24c8db?style=for-the-badge&logo=tauri&logoColor=white"></a>
   <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/Rust-stable-b7410e?style=for-the-badge&logo=rust&logoColor=white"></a>
@@ -39,12 +39,25 @@ working side and a public release side. It is a work in progress.
 - **Commit details and diffs.** Unified or side-by-side diffs with syntax colours and changed words marked. Binary,
   oversized and renamed files get a short explanation instead.
 - **Blame and file history** for any file in any commit.
+- **Changes and commits.** Stage, unstage, discard and commit whole files or single hunks, amend the last commit, and add
+  a file or extension to `.gitignore` from a right-click menu. See [docs/actions.md](docs/actions.md).
+- **Branches, merges and stashes.** Create, rename, delete, check out and merge branches, reset to a commit, and set work
+  aside in a stash.
+- **History edits.** Cherry-pick, revert and rebase onto another branch, or edit a branch's own commits: reorder, squash,
+  drop and reword. A commit that conflicts stops so you can settle it, then continue or abort.
+- **Sync.** Fetch, pull (merge or rebase), push, push tags, and a force push that only replaces the commits it showed
+  you, from a bar at the top of Changes.
+- **Merge conflicts.** Each conflict is explained in plain words and settled with a button (mine, theirs or both) or in an
+  inline editor.
+- **Files tab.** Browse the project, edit text files with syntax colours, line numbers and find, and create files and
+  folders.
+- **Activity.** The operation log and restore points, so a risky action can be undone.
 - **Backups** before risky git actions, with restore. See [docs/backups.md](docs/backups.md).
 - **Themes.** Built-in dark and light themes, plus your own as JSON. See [docs/themes.md](docs/themes.md).
 - **GitHub sign-in** with a device code, the token kept in the system keychain, or reuse of a signed-in `gh`. See
   [docs/github.md](docs/github.md).
 
-Staging, releases and uploads are planned and not built yet.
+Private-to-public staging (preview, sync, verification and push) and the release suite (version bump, annotated tag, zip pack, release notes, GitHub release publish, and the release history + checklist view) are built.
 
 ## Screenshots
 
@@ -65,7 +78,7 @@ Staging, releases and uploads are planned and not built yet.
 
 ## Status
 
-Early development. Working now: the project hub (add, clone and create projects, ahead/behind and change counts), backups before risky git actions with restore, themes, GitHub sign-in, and history (commit graph, log, search, commit details, diffs and blame). Staging, releases and uploads are not built yet.
+Early development. Working now: the project hub (add, clone and create projects, ahead/behind and change counts), backups before risky git actions with restore, themes, GitHub sign-in, history (commit graph, log, search, commit details, diffs and blame), and write actions (staging, commits, branches, merges, stashes, conflict resolution, cherry-pick, revert, rebase and editing commits, fetch, pull and push, a Files tab and Activity with restore points). The write views are checked by automated tests but have had little hand testing in the running app, and sync has not yet been tried against GitHub. Private-to-public staging and the release suite (version bump, annotated tag, zip pack, release notes, GitHub release publish, release history + checklist) are built but not yet tried in the running app.
 
 ## Requirements
 
@@ -79,6 +92,7 @@ Optional, for specific work:
 - `git-lfs`: Git LFS projects and test fixtures
 - `gh` (logged in): publishing releases with `make publish-release`
 - `patchelf` and `dpkg`: local Linux AppImage and .deb builds
+- Docker: `make build`, an AppImage to try on another Linux computer (built in a Debian 12 container)
 - `tauri-driver` and a WebKitWebDriver: end-to-end UI tests (not used yet)
 
 ## Setup
@@ -152,4 +166,13 @@ Common commands from the repo root: `make lint`, `make test`, `make fmt`.
 
 ## Releases
 
-Release builds are published on this repository's GitHub releases page.
+Release builds are published on this repository's GitHub releases page. There is no installer: each download is one file.
+The builds are unsigned, so Windows SmartScreen and macOS Gatekeeper warn on first run (macOS: right-click the app and
+choose Open).
+
+- **Windows:** `Project-Manager-v<version>-windows-x64.exe`. Needs the WebView2 runtime, which Windows 10 and 11 include.
+- **Linux:** `Project-Manager-v<version>-linux-x64`, a plain executable that needs `webkit2gtk-4.1` and GTK installed
+  (run `chmod +x` first), or an AppImage that needs nothing.
+- **macOS:** `Project-Manager-v<version>-macos.zip`, holding the app.
+
+Which files a release has depends on the version: see its notes.

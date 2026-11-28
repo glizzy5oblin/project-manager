@@ -8,6 +8,7 @@
     import type { DiffLine } from "../bindings/DiffLine";
     import type { FileDiff } from "../bindings/FileDiff";
     import type { Hunk } from "../bindings/Hunk";
+    import type { RepoSide } from "../bindings/RepoSide";
     import type { WorkSide } from "../bindings/WorkSide";
     import { highlight } from "../highlight";
     import { langForPath, splitRows, type Token } from "../history";
@@ -16,19 +17,25 @@
 
     let {
         projectId,
+        side = "private",
         commit = "",
         parent = null,
         work = null,
         version = 0,
         file,
+        stagingPath = null,
         mode = $bindable("unified"),
         hunkAction = null,
     }: {
         projectId: string;
+        /** Which repository of a two-repo project the commit or working-tree change is in. */
+        side?: RepoSide;
         commit?: string;
         parent?: number | null;
         /** Show the file's staged or unstaged change instead of a commit's. */
         work?: WorkSide | null;
+        /** Show the file's staging diff (private side, old side public) instead of a commit's. */
+        stagingPath?: string | null;
         /** Bump to load again (the working tree changed). */
         version?: number;
         file: ChangedFile;
@@ -64,16 +71,20 @@
         loading = true;
         error = null;
         try {
-            const d = work
-                ? await api.workDiff(projectId, file.path, work, force)
-                : await api.fileDiff(
-                      projectId,
-                      commit,
-                      parent,
-                      file.path,
-                      file.oldPath,
-                      force,
-                  );
+            const d = stagingPath
+                ? await api.stagingDiff(projectId, stagingPath, force)
+                : work
+                  ? await api.workDiff(projectId, file.path, work, force, side)
+                  : await api.fileDiff(
+                        projectId,
+                        commit,
+                        parent,
+                        file.path,
+                        file.oldPath,
+                        force,
+                        null,
+                        side,
+                    );
             if (mine !== request) return;
             diff = d;
             limit = STEP;
@@ -114,7 +125,16 @@
     }
 
     $effect(() => {
-        void [projectId, commit, parent, work, file.path, file.oldPath];
+        void [
+            projectId,
+            side,
+            commit,
+            parent,
+            work,
+            stagingPath,
+            file.path,
+            file.oldPath,
+        ];
         diff = null;
         void load(false);
     });

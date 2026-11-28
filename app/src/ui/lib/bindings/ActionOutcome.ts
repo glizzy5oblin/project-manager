@@ -7,7 +7,7 @@ export type ActionOutcome = { title: string,
  */
 backup: BackupRecord | null, 
 /**
- * Files left with conflicts when a merge stopped on them. The merge is then in progress:
- * resolve and commit, or abort it.
+ * Files left with conflicts when a merge, cherry-pick, revert or rebase stopped on them.
+ * It is then in progress: settle the files and commit or continue, or abort it.
  */
 conflicts: Array<string>, };

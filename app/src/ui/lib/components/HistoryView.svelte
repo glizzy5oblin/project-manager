@@ -12,6 +12,7 @@
     import type { HeadState } from "../bindings/HeadState";
     import type { LogQuery } from "../bindings/LogQuery";
     import type { RefLabel } from "../bindings/RefLabel";
+    import type { RepoSide } from "../bindings/RepoSide";
     import { commitCommands, commitMenu } from "../commitMenu.svelte";
     import { offerMenu } from "../contextMenu";
     import { graphShapes } from "../graphShapes";
@@ -32,6 +33,7 @@
 
     let {
         id,
+        side = "private",
         active,
         changed,
         showGraph,
@@ -41,6 +43,8 @@
         path = $bindable(""),
     }: {
         id: string;
+        /** Which repository of a two-repo project this history belongs to. */
+        side?: RepoSide;
         active: boolean;
         /** Bumped when the project's files change on disk. */
         changed: number;
@@ -63,6 +67,8 @@
     /** Bumped when rows arrive, the theme changes or the pixel ratio changes: redraw. */
     let version = $state(0);
     let loadedFor = -1;
+    /** True while the graph info reloads after a change on disk. */
+    let rebuilding = $state(false);
 
     let scroller = $state<HTMLDivElement>();
     let scrollTop = $state(0);
@@ -93,14 +99,19 @@
     let gotoMissing = $state(false);
 
     async function loadGraph() {
+        rebuilding = true;
         try {
-            const next = await api.graphLoad(id, $state.snapshot(options));
+            const next = await api.graphLoad(
+                id,
+                $state.snapshot(options),
+                side,
+            );
             error = null;
             if (info && next.generation === info.generation) return;
             cache?.close();
             const gen = next.generation;
             cache = new RowCache(
-                (start, count) => api.graphRows(id, gen, start, count),
+                (start, count) => api.graphRows(id, gen, start, count, side),
                 () => version++,
                 (e) => {
                     if ((e as AppError).kind === "stale") void loadGraph();
@@ -114,14 +125,28 @@
             if (selected) void locate(selected);
         } catch (e) {
             error = e as AppError;
+        } finally {
+            rebuilding = false;
         }
     }
 
-    // Load when first shown and after changes on disk, only while the tab is showing.
+    let loadedSide: RepoSide | null = null;
+    // Load when first shown, after changes on disk, and whenever the repository side switches,
+    // only while the tab is showing.
     $effect(() => {
-        if (active && loadedFor !== changed) {
+        const sideChanged = loadedSide !== side;
+        if (active && (loadedFor !== changed || sideChanged)) {
             loadedFor = changed;
-            untrack(() => void loadGraph());
+            loadedSide = side;
+            untrack(() => {
+                if (sideChanged) {
+                    // The other repo's generation counter is unrelated, so drop the current graph
+                    // rather than risk the generation-equality check skipping the swap.
+                    info = null;
+                    searchRows = null;
+                }
+                void loadGraph();
+            });
         }
     });
 
@@ -151,13 +176,13 @@
             searchRows = null;
             searchError = null;
             searching = false;
-            untrack(() => void api.logSearchCancel(id).catch(() => {}));
+            untrack(() => void api.logSearchCancel(id, side).catch(() => {}));
             return;
         }
         const timer = setTimeout(async () => {
             searching = true;
             try {
-                const r = await api.logSearch(id, gen, q);
+                const r = await api.logSearch(id, gen, q, side);
                 if (mine !== searchRequest) return;
                 searchRows = r.rows;
                 searchError = null;
@@ -279,6 +304,7 @@
             refs: r.refs,
             head,
             busy: !!actions.busy[id],
+            parents: r.parents,
         });
         offerMenu(e, {
             items: menu.items,
@@ -333,7 +359,9 @@
         if (!info || !cache) return false;
         const gen = info.generation;
         const c = cache;
-        const row = await api.graphFind(id, gen, commit).catch(() => null);
+        const row = await api
+            .graphFind(id, gen, commit, side)
+            .catch(() => null);
         if (info?.generation !== gen) return false;
         if (row === null) {
             selectedRow = null;
@@ -575,7 +603,9 @@
                     </button>
                 {/if}
                 <span class="status" aria-live="polite">
-                    {#if searching}
+                    {#if rebuilding}
+                        Rebuilding…
+                    {:else if searching}
                         Searching…
                     {:else if searchRows}
                         {searchRows.length} match{searchRows.length === 1
@@ -755,6 +785,14 @@
                                         ⑂ {b.name} branched here
                                     </span>
                                 {/each}
+                                {#if !v.row.staged}
+                                    <span
+                                        class="private-mark"
+                                        title="Not on the public side yet: this commit is newer than the last sync and will be staged by the next sync"
+                                    >
+                                        private
+                                    </span>
+                                {/if}
                                 {v.row.subject}
                             </span>
                             <span class="author" title={v.row.authorEmail}>
@@ -802,6 +840,16 @@
                                             ? "var(--bg)"
                                             : n.color}
                                     />
+                                    {#if !n.staged}
+                                        <circle
+                                            cx={n.cx}
+                                            cy={n.cy}
+                                            r={n.r * 0.42}
+                                            style:fill={n.hollow
+                                                ? n.color
+                                                : "var(--bg)"}
+                                        />
+                                    {/if}
                                     {#if n.ring}
                                         <circle
                                             cx={n.cx}
@@ -1061,6 +1109,17 @@
         padding: 0 0.4rem;
         border: 1px dashed currentColor;
         border-radius: 9px;
+        font-size: 11.5px;
+        line-height: 1.45;
+        vertical-align: 1px;
+    }
+    .private-mark {
+        display: inline-block;
+        margin-right: 0.35rem;
+        padding: 0 0.4rem;
+        border: 1px dashed var(--accent);
+        border-radius: 9px;
+        color: var(--accent);
         font-size: 11.5px;
         line-height: 1.45;
         vertical-align: 1px;

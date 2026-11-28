@@ -6,6 +6,9 @@
 //! - `heads/<branch>` and `tags/<tag>`: every local branch and tag;
 //! - `index`: a commit whose tree is the staged index; with conflicts, the entries that are not
 //!   conflicted (the conflicted ones are listed in the record, their blobs kept by `blobs/<n>`);
+//! - `remotes/<remote>/<branch>`: every remote-tracking branch, so a force push never loses the
+//!   commits it replaced on the remote (restoring does not move remote-tracking branches: they
+//!   follow the remote, and the next fetch would undo it);
 //! - `pending/<n>`: the commits a merge, cherry-pick or revert in progress was applying;
 //! - `worktree`: a commit whose tree is the whole working tree, untracked files included
 //!   (ignored files are not), built in a temporary index so the real index and `refs/stash`
@@ -122,6 +125,9 @@ pub struct BackupRecord {
     /// stash does not lose it, and a restore puts back the ones that are gone.
     #[serde(default)]
     pub stashes: Vec<StashTip>,
+    /// Every remote-tracking branch (`origin/main`), kept under `remotes/`. Not restored.
+    #[serde(default)]
+    pub remotes: Vec<RefTip>,
     /// The repository uses Git LFS.
     pub lfs: bool,
     #[ts(type = "string | null")]
@@ -312,6 +318,12 @@ impl Backups {
         };
         let branches = self.tips("refs/heads/")?;
         let tags = self.tips("refs/tags/")?;
+        // `origin/HEAD` only points at another remote-tracking branch.
+        let remotes: Vec<RefTip> = self
+            .tips("refs/remotes/")?
+            .into_iter()
+            .filter(|t| !t.name.ends_with("/HEAD"))
+            .collect();
         let pending = self.pending_heads()?;
         let merge_msg = self.read_git_file("MERGE_MSG")?;
         let merge_mode = self.read_git_file("MERGE_MODE")?;
@@ -364,6 +376,9 @@ impl Backups {
         for (n, blob) in conflict_blobs.iter().enumerate() {
             add(format!("{prefix}blobs/{n}"), blob);
         }
+        for t in &remotes {
+            add(format!("{prefix}remotes/{}", t.name), &t.commit);
+        }
         for (n, st) in stashes.iter().enumerate() {
             add(format!("{prefix}stash/{n}"), &st.commit);
         }
@@ -391,6 +406,7 @@ impl Backups {
             merge_msg,
             merge_mode,
             stashes,
+            remotes,
             lfs,
             bundle: None,
         };
@@ -676,8 +692,13 @@ impl Backups {
         self.write_index(&index)
     }
 
-    /// Apply the retention policy at time `now` (unix seconds). Returns the deleted ids.
-    pub fn prune(&self, policy: Retention, now: u64) -> Result<Vec<String>, BackupError> {
+    /// The records the policy would delete under the default retention at `now` (newest first).
+    /// Nothing is deleted; call [`Backups::cleanup`] to apply it.
+    pub fn cleanup_preview(
+        &self,
+        policy: Retention,
+        now: u64,
+    ) -> Result<Vec<BackupRecord>, BackupError> {
         let list = self.list()?; // newest first
         let mut doomed = Vec::new();
         for (i, b) in list.iter().enumerate() {
@@ -686,13 +707,26 @@ impl Backups {
                 .max_age_days
                 .is_some_and(|d| now.saturating_sub(b.created) > u64::from(d) * 86_400);
             if too_many || too_old {
-                doomed.push(b.id.clone());
+                doomed.push(b.clone());
             }
         }
-        for id in &doomed {
+        Ok(doomed)
+    }
+
+    /// Apply the retention policy at time `now` (unix seconds): delete every record the preview
+    /// would delete. Returns the deleted ids.
+    pub fn cleanup(&self, policy: Retention, now: u64) -> Result<Vec<String>, BackupError> {
+        let doomed = self.cleanup_preview(policy, now)?;
+        let ids: Vec<String> = doomed.iter().map(|b| b.id.clone()).collect();
+        for id in &ids {
             self.delete(id)?;
         }
-        Ok(doomed)
+        Ok(ids)
+    }
+
+    /// Apply the retention policy at time `now` (unix seconds). Returns the deleted ids.
+    pub fn prune(&self, policy: Retention, now: u64) -> Result<Vec<String>, BackupError> {
+        self.cleanup(policy, now)
     }
 
     /// What [`Backups::restore`] of `id` would change, without changing anything.

@@ -49,8 +49,11 @@ const DARK: &[&str] = &[
 ];
 
 const LIGHT: &[&str] = &[
-    "#f6f7f9", "#ffffff", "#eef0f4", "#d5d9e0", "#1b1f27", "#5d6575", "#2f6fd6", "#ffffff",
-    "#1d5bbf", "#c93c3c", "#a86f00", "#23874e", "#2f6fd6", "#c2457a", "#23874e", "#a86f00",
+    // Accent, warning and success are picked so every text-on-bg pair in the light theme clears
+    // 4.5:1 (WCAG AA): #2a63bd on the near-white background is 5.41, #976200 is 4.82, and
+    // #1f743f is 5.40. Graph lanes reuse them, and pass 3:1 (non-text) as well.
+    "#f6f7f9", "#ffffff", "#eef0f4", "#d5d9e0", "#1b1f27", "#5d6575", "#2a63bd", "#ffffff",
+    "#1d5bbf", "#c93c3c", "#976200", "#1f743f", "#2a63bd", "#c2457a", "#1f743f", "#976200",
     "#7552c9", "#1d8a93", "#c9632b", "#6b7385",
 ];
 
@@ -97,13 +100,165 @@ pub struct ThemeList {
     pub problems: Vec<ThemeProblem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ThemeFile {
     name: String,
     scheme: ColorScheme,
     #[serde(default)]
     colors: BTreeMap<String, String>,
+}
+
+/// An id that names a theme file: 1 to 40 lowercase letters, digits, `-` or `_`.
+fn slug(name: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in name.trim().to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            parts.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    let slug: String = parts.join("-");
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.chars().take(40).collect())
+    }
+}
+
+/// Every key and every value of a `colors` map, checked against [`KEYS`] and [`is_color`].
+fn check_colors(colors: &BTreeMap<String, String>) -> Result<(), String> {
+    for (k, v) in colors {
+        if !KEYS.contains(&k.as_str()) {
+            return Err(format!(
+                "unknown color \"{k}\" (known: {})",
+                KEYS.join(", ")
+            ));
+        }
+        let v = v.trim();
+        if !is_color(v) {
+            return Err(format!(
+                "\"{k}\": {v:?} is not a color (use #rrggbb, rgb(), hsl() or similar)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The colors that differ from the built-in theme of `scheme`, so a file only carries its own.
+fn diff_colors(scheme: ColorScheme, colors: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let builtin = builtin(scheme);
+    let mut diff = BTreeMap::new();
+    for (k, v) in colors {
+        if builtin.colors.get(k).map(|b| b.as_str()) != Some(v.as_str()) {
+            diff.insert(k.clone(), v.trim().to_string());
+        }
+    }
+    diff
+}
+
+fn write_file(
+    path: &Path,
+    name: &str,
+    scheme: ColorScheme,
+    colors: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let file = ThemeFile {
+        name: name.trim().to_string(),
+        scheme,
+        colors: colors.clone(),
+    };
+    let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Rewrite the user theme `<id>.json` in `dir`, keeping its name and scheme and storing only the
+/// colors that differ from the built-in theme of that scheme.
+pub fn save_user(dir: &Path, id: &str, colors: &BTreeMap<String, String>) -> Result<(), String> {
+    check_colors(colors)?;
+    let theme = load(dir)
+        .themes
+        .into_iter()
+        .find(|t| t.id == id && !t.builtin)
+        .ok_or_else(|| format!("no user theme named \"{id}\""))?;
+    let file = dir.join(format!("{id}.json"));
+    let diff = diff_colors(theme.scheme, colors);
+    write_file(&file, &theme.name, theme.scheme, &diff)
+}
+
+/// Save a new user theme in `dir` under the file name derived from `name`, returning its id.
+pub fn save_as(
+    dir: &Path,
+    name: &str,
+    scheme: ColorScheme,
+    colors: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 60 {
+        return Err("a name is required (1 to 60 characters)".into());
+    }
+    check_colors(colors)?;
+    let id = slug(name)
+        .ok_or_else(|| "the name must contain at least one letter or digit".to_string())?;
+    if id == "dark" || id == "light" {
+        return Err(format!(
+            "\"{id}\" is the name of a built-in theme; say something else"
+        ));
+    }
+    let file = dir.join(format!("{id}.json"));
+    if file.exists() {
+        return Err(format!("a theme named \"{id}\" already exists"));
+    }
+    let diff = diff_colors(scheme, colors);
+    write_file(&file, name, scheme, &diff)?;
+    Ok(id)
+}
+
+/// Write the theme to `path` as a complete file (all colors), ready to be copied or shared.
+pub fn export_theme(theme: &Theme, path: &Path) -> Result<(), String> {
+    let file = ThemeFile {
+        name: theme.name.clone(),
+        scheme: theme.scheme,
+        colors: theme.colors.clone(),
+    };
+    let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Validate a theme file at `path` and copy it into `dir` under the name derived from its file
+/// stem, returning the new id. The file is copied unchanged.
+pub fn import_theme(dir: &Path, path: &Path) -> Result<String, String> {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = slug(&stem)
+        .ok_or_else(|| "the file name must contain at least one letter or digit".to_string())?;
+    if id == "dark" || id == "light" {
+        return Err(format!(
+            "\"{id}\" is the name of a built-in theme; rename the file"
+        ));
+    }
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    if meta.len() > MAX_THEME_BYTES {
+        return Err("the file is larger than 64 KB".into());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    parse_theme(&id, &text)?;
+    let file = dir.join(format!("{id}.json"));
+    if file.exists() {
+        return Err(format!("a theme named \"{id}\" already exists"));
+    }
+    std::fs::copy(path, &file)
+        .map_err(|e| format!("could not copy the theme into the themes folder: {e}"))?;
+    Ok(id)
 }
 
 pub fn builtin(scheme: ColorScheme) -> Theme {

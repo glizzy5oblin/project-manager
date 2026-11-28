@@ -6,7 +6,7 @@ export type ProjectEntry = { id: string,
  */
 name: string, 
 /**
- * Repository root (where the `.proj` file is), canonical.
+ * Project root (where the `.proj` file is), canonical.
  */
 path: string, 
 /**

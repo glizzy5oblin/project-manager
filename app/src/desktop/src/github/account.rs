@@ -256,17 +256,59 @@ impl GitHub {
         self.set_source(None)
     }
 
+    /// Run `f` with the signed-in user's token. A rejected token is dropped from the cache so
+    /// the next status check reports it.
+    fn with_token<T>(
+        &self,
+        f: impl FnOnce(&Token) -> Result<T, GitHubError>,
+    ) -> Result<T, GitHubError> {
+        let (_, token) = self.token()?;
+        let r = f(&token);
+        if matches!(r, Err(GitHubError::Unauthorized)) {
+            self.cache().token = None;
+        }
+        r
+    }
+
     /// GET an API path as the signed-in user. A rejected token is dropped from the cache so the
     /// next status check reports it.
     pub fn api_get<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
     ) -> Result<Reply<T>, GitHubError> {
-        let (_, token) = self.token()?;
-        let r = self.client.api_get(path, &token);
-        if matches!(r, Err(GitHubError::Unauthorized)) {
-            self.cache().token = None;
-        }
-        r
+        self.with_token(|token| self.client.api_get(path, token))
+    }
+
+    /// POST a JSON body as the signed-in user (create a resource).
+    pub fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<Reply<T>, GitHubError> {
+        self.with_token(|token| self.client.api_post(path, token, body))
+    }
+
+    /// PATCH a JSON body as the signed-in user (edit a resource).
+    pub fn patch<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<Reply<T>, GitHubError> {
+        self.with_token(|token| self.client.api_patch(path, token, body))
+    }
+
+    /// DELETE an API path as the signed-in user.
+    pub fn delete(&self, path: &str) -> Result<(), GitHubError> {
+        self.with_token(|token| self.client.api_delete(path, token))
+    }
+
+    /// POST raw bytes with the given content type as the signed-in user (e.g. an asset upload).
+    pub fn upload<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<Reply<T>, GitHubError> {
+        self.with_token(|token| self.client.api_upload(path, token, content_type, data))
     }
 }

@@ -66,10 +66,24 @@ export function explain(info: ConflictInfo): { headline: string; why: string } {
 }
 
 /** What to do, as short steps. */
+/** The last step: how the operation that stopped is finished or cancelled. */
+function finishStep(info: ConflictInfo): string {
+    switch (info.during) {
+        case "cherryPick":
+            return "When every conflicted file is resolved, press Continue to commit the copied change, or Abort cherry-pick to go back to how things were.";
+        case "revert":
+            return "When every conflicted file is resolved, press Continue to commit the undo, or Abort revert to go back to how things were.";
+        case "rebase":
+            return "When every conflicted file is resolved, press Continue to carry on with your remaining commits, or Abort rebase to put your branch back where it was.";
+        case "merge":
+            return "When every conflicted file is resolved, commit to finish the merge, or use Abort merge to cancel it and go back to how things were.";
+        default:
+            return "When every conflicted file is resolved, commit to finish.";
+    }
+}
+
 export function steps(info: ConflictInfo): string[] {
-    const finish = [
-        "When every conflicted file is resolved, commit to finish the merge, or use Abort merge to cancel it and go back to how things were.",
-    ];
+    const finish = [finishStep(info)];
     switch (info.kind) {
         case "bothModified":
         case "bothAdded":
@@ -129,6 +143,29 @@ export function findRegions(text: string): TextRegion[] {
         else if (part === "theirs") open.theirs.push(raw);
     });
     return out;
+}
+
+/** The conflicts in `text` with `ours` always your lines (see `textChoice`). */
+export function yourRegions(text: string, swapped: boolean): TextRegion[] {
+    const found = findRegions(text);
+    return swapped
+        ? found.map((r) => ({ ...r, ours: r.theirs, theirs: r.ours }))
+        : found;
+}
+
+/**
+ * A choice about "your" lines turned into one about the file's markers. During a rebase the
+ * markers put the branch being rebased onto first and your commit second (`info.swapped`).
+ */
+export function textChoice(choice: Choice, swapped: boolean): Choice {
+    if (!swapped) return choice;
+    const turned: Record<Choice, Choice> = {
+        ours: "theirs",
+        theirs: "ours",
+        both: "theirsFirst",
+        theirsFirst: "both",
+    };
+    return turned[choice];
 }
 
 /** `text` with conflict number `index` settled as `choice`. Other conflicts are left alone. */

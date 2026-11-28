@@ -8,16 +8,17 @@ in `app/src/desktop/src/backup/`.
 
 A backup with id `<id>` is a set of refs under `refs/pm/backups/<id>/`:
 
-| Ref              | Contents                                                                 |
-| ---------------- | ------------------------------------------------------------------------ |
-| `head`           | The commit HEAD pointed at. Absent on an unborn branch.                  |
-| `heads/<branch>` | Every local branch tip.                                                  |
-| `tags/<tag>`     | Every tag. Annotated tags keep their tag object.                         |
-| `index`          | A commit whose tree is the staged index, conflicted entries left out.    |
-| `pending/<n>`    | The commits a merge, cherry-pick or revert in progress was applying.     |
-| `blobs/<n>`      | The file versions of each conflicted entry (base, ours, theirs).         |
-| `stash/<n>`      | Each stash commit, newest first, so a dropped stash is not lost.         |
-| `worktree`       | A commit whose tree is the whole working tree, untracked files included. |
+| Ref               | Contents                                                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `head`            | The commit HEAD pointed at. Absent on an unborn branch.                                                                     |
+| `heads/<branch>`  | Every local branch tip.                                                                                                     |
+| `tags/<tag>`      | Every tag. Annotated tags keep their tag object.                                                                            |
+| `index`           | A commit whose tree is the staged index, conflicted entries left out.                                                       |
+| `pending/<n>`     | The commits a merge, cherry-pick or revert in progress was applying.                                                        |
+| `blobs/<n>`       | The file versions of each conflicted entry (base, ours, theirs).                                                            |
+| `stash/<n>`       | Each stash commit, newest first, so a dropped stash is not lost.                                                            |
+| `worktree`        | A commit whose tree is the whole working tree, untracked files included.                                                    |
+| `remotes/<r>/<b>` | Every remote-tracking branch tip, so a force push never loses what it replaced. Not restored: these refs follow the remote. |
 
 Ignored files are not backed up. Nothing an action does touches them either, except
 `git clean -x`, which Project Manager does not run.

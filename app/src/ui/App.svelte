@@ -7,10 +7,14 @@
     import type { ProjectEntry } from "./lib/bindings/ProjectEntry";
     import type { ProjectSummary } from "./lib/bindings/ProjectSummary";
     import type { ProjectView } from "./lib/bindings/ProjectView";
+    import type { RepoSide } from "./lib/bindings/RepoSide";
     import type { RepoChanged } from "./lib/bindings/RepoChanged";
     import type { Session } from "./lib/bindings/Session";
+    import type { Settings } from "./lib/bindings/Settings";
     import type { ThemeList } from "./lib/bindings/ThemeList";
+    import { openUrl } from "@tauri-apps/plugin-opener";
     import ActionDialog from "./lib/components/ActionDialog.svelte";
+    import CommandPalette from "./lib/components/CommandPalette.svelte";
     import ContextMenu from "./lib/components/ContextMenu.svelte";
     import ErrorBox from "./lib/components/ErrorBox.svelte";
     import Hub from "./lib/components/Hub.svelte";
@@ -23,8 +27,11 @@
         moveTab,
         openTab,
         pruneTabs,
+        setSide,
         setView,
+        VIEWS,
     } from "./lib/tabs";
+    import type { Command } from "./lib/commandPalette";
     import { initTasks } from "./lib/tasks.svelte";
     import { applyTheme, pickTheme } from "./lib/theme";
 
@@ -35,12 +42,67 @@
     let hubError = $state<AppError | null>(null);
     let gitError = $state<AppError | null>(null);
     let themes = $state<ThemeList>({ themes: [], problems: [] });
-    let themeId = $state("dark");
+    let settings = $state<Settings>({ theme: "dark", backups: true });
     /** Per project: bumped when its files change, so its tab re-reads. */
     let changed = $state<Record<string, number>>({});
+    let paletteOpen = $state(false);
 
     const byId = $derived(new Map(projects.map((p) => [p.id, p])));
     const names = $derived(new Map(projects.map((p) => [p.id, p.name])));
+    /** The command palette's commands: whole-app actions plus the active tab's views. */
+    const paletteCommands = $derived.by(() => {
+        const commands: Command[] = [
+            {
+                id: "hub",
+                label: "Go to hub",
+                hint: "Close every tab and show the hub",
+            },
+        ];
+        if (session.active !== null) {
+            commands.push({
+                id: "close-tab",
+                label: "Close active tab",
+                hint: "Close the current project tab",
+            });
+            for (const view of VIEWS) {
+                commands.push({
+                    id: `view:${view.id}`,
+                    label: `View: ${view.label}`,
+                    hint: view.hint,
+                });
+            }
+        }
+        commands.push({
+            id: "docs",
+            label: "Open docs",
+            hint: "The project's documentation in your browser",
+        });
+        commands.push({
+            id: "preferences",
+            label: "Open preferences",
+            hint: "Preferences dialog (Ctrl+,)",
+        });
+        return commands;
+    });
+
+    function runPaletteCommand(id: string) {
+        paletteOpen = false;
+        if (id === "hub") {
+            update({ ...session, active: null });
+        } else if (id === "close-tab" && session.active !== null) {
+            update(closeTab(session, session.active));
+        } else if (id === "docs") {
+            void openUrl(
+                "https://github.com/glizzy5oblin/project-manager/tree/main/docs",
+            );
+        } else if (id === "preferences") {
+            window.dispatchEvent(new CustomEvent("pm:open-preferences"));
+        } else if (id.startsWith("view:") && session.active !== null) {
+            update(
+                setView(session, session.active, id.slice(5) as ProjectView),
+            );
+        }
+    }
 
     async function refresh() {
         loading = true;
@@ -76,10 +138,19 @@
     }
 
     async function chooseTheme(id: string) {
-        themeId = id;
+        settings = { ...settings, theme: id };
         setTheme(themes, id);
         try {
-            await api.settingsSave({ theme: id });
+            await api.settingsSave(settings);
+        } catch (e) {
+            hubError = toAppError(e);
+        }
+    }
+
+    async function chooseBackups(backups: boolean) {
+        settings = { ...settings, backups };
+        try {
+            await api.settingsSave(settings);
         } catch (e) {
             hubError = toAppError(e);
         }
@@ -103,33 +174,45 @@
     onMount(() => {
         const unlisten: Promise<() => void>[] = [];
         (async () => {
-            const [settings, list, saved] = await Promise.all([
-                api.settingsLoad(),
-                api.themesList(),
-                api.sessionLoad(),
-            ]);
-            themeId = settings.theme;
-            setTheme(list, settings.theme);
-            unlisten.push(
-                listen<ThemeList>("themes-changed", (e) =>
-                    setTheme(e.payload, themeId),
-                ),
-            );
-            unlisten.push(
-                listen<RepoChanged>("repo-changed", (e) => {
-                    for (const id of e.payload.ids) {
-                        changed[id] = (changed[id] ?? 0) + 1;
-                        void refreshOne(id);
-                    }
-                }),
-            );
-            await initTasks();
-            // Tabs wait for the project list: until then they could only show ids ("p1").
-            await refresh();
-            session = pruneTabs(saved, new Set(projects.map((p) => p.id)));
-            ready = true;
+            try {
+                const [loaded, list, loadedSession] = await Promise.all([
+                    api.settingsLoad(),
+                    api.themesList(),
+                    api.sessionLoad(),
+                ]);
+                settings = loaded;
+                setTheme(list, settings.theme);
+                unlisten.push(
+                    listen<ThemeList>("themes-changed", (e) =>
+                        setTheme(e.payload, settings.theme),
+                    ),
+                );
+                unlisten.push(
+                    listen<RepoChanged>("repo-changed", (e) => {
+                        for (const id of e.payload.ids) {
+                            changed[id] = (changed[id] ?? 0) + 1;
+                            void refreshOne(id);
+                        }
+                    }),
+                );
+                await initTasks();
+                // Tabs wait for the project list: until then they could only show ids ("p1").
+                await refresh();
+                session = pruneTabs(
+                    loadedSession,
+                    new Set(projects.map((p) => p.id)),
+                );
+            } catch (e) {
+                // A failed startup leaves the app usable (hub visible, tabs retried on next
+                // focus) rather than blank; the error is shown in the hub.
+                hubError = toAppError(e);
+            } finally {
+                // ready gates the session-save / watch effects and the focus handler; set it
+                // even on failure so the app never stays inert.
+                ready = true;
+            }
             api.gitCheck().catch((e) => (gitError = toAppError(e)));
-        })().catch((e) => (hubError = toAppError(e)));
+        })();
         const focus = () => {
             if (ready && session.active === null) void refresh();
         };
@@ -172,6 +255,8 @@
             session.active !== null
         ) {
             update(closeTab(session, session.active));
+        } else if (mod && e.key.toLowerCase() === "k") {
+            paletteOpen = true;
         } else {
             return;
         }
@@ -199,13 +284,15 @@
                 {loading}
                 error={hubError}
                 themes={themes.themes}
-                {themeId}
+                themeId={settings.theme}
+                backups={settings.backups}
                 themeProblems={themes.problems}
                 onopen={(id) => update(openTab(session, id))}
                 onadded={added}
                 onremove={remove}
                 onrefresh={refresh}
                 ontheme={chooseTheme}
+                onbackups={chooseBackups}
             />
         </div>
         {#each session.tabs as tab (tab.projectId)}
@@ -218,10 +305,13 @@
                     id={tab.projectId}
                     summary={byId.get(tab.projectId)}
                     view={tab.view}
+                    side={tab.side}
                     active={session.active === tab.projectId}
                     changed={changed[tab.projectId] ?? 0}
                     onview={(v: ProjectView) =>
                         update(setView(session, tab.projectId, v))}
+                    onside={(s: RepoSide) =>
+                        update(setSide(session, tab.projectId, s))}
                 />
             </div>
         {/each}
@@ -230,6 +320,13 @@
 </div>
 <ActionDialog />
 <ContextMenu />
+{#if paletteOpen}
+    <CommandPalette
+        commands={paletteCommands}
+        onpick={runPaletteCommand}
+        onclose={() => (paletteOpen = false)}
+    />
+{/if}
 
 <style>
     .app {

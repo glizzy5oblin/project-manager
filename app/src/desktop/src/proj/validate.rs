@@ -50,6 +50,14 @@ pub(crate) fn validate(proj: &ProjFile) -> Vec<Issue> {
                 &format!("workflow.{side}.remote"),
                 "must not be empty".into(),
             );
+        } else if s.remote.starts_with('-') || s.remote.chars().any(char::is_whitespace) {
+            issue(
+                &format!("workflow.{side}.remote"),
+                format!(
+                    "\"{}\" must not start with \"-\" or contain whitespace",
+                    s.remote
+                ),
+            );
         }
         if let Some(p) = &s.path
             && p.trim().is_empty()
@@ -122,6 +130,24 @@ pub(crate) fn validate(proj: &ProjFile) -> Vec<Issue> {
         }
     }
 
+    let mut targets = std::collections::BTreeSet::new();
+    for (from, to) in &st.map {
+        let key = format!("staging.map.\"{from}\"");
+        if let Err(msg) = check_relative(from).and_then(|_| check_relative(to)) {
+            issue(&key, msg);
+        } else if from == to {
+            issue(
+                &key,
+                "maps a file to itself; use staging.include instead".into(),
+            );
+        } else if !targets.insert(to.as_str()) {
+            issue(
+                &key,
+                format!("\"{to}\" is the target of more than one entry"),
+            );
+        }
+    }
+
     // [release]
     let rel = &proj.release;
     for (i, f) in rel.version_files.iter().enumerate() {
@@ -145,6 +171,29 @@ pub(crate) fn validate(proj: &ProjFile) -> Vec<Issue> {
             "release.asset_name",
             "must be a file name, not a path".into(),
         );
+    }
+    let mut seen_groups = Vec::new();
+    for (i, g) in rel.changelog_groups.iter().enumerate() {
+        let key = format!("release.changelog_groups[{i}]");
+        let g = g.trim().to_lowercase();
+        if g.is_empty() {
+            issue(&key, "must not be empty".into());
+            continue;
+        }
+        if !g
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            issue(
+                &key,
+                "must be a lowercase prefix like \"feat\" (letters, digits, '-')".into(),
+            );
+            continue;
+        }
+        if seen_groups.contains(&g) {
+            issue(&key, "duplicate release changelog group".into());
+        }
+        seen_groups.push(g);
     }
     let mut seen = Vec::new();
     for (i, t) in rel.targets.iter().enumerate() {

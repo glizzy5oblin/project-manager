@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::blocking::{Client as Http, Response};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use reqwest::{StatusCode, Url, redirect};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -31,6 +31,8 @@ const USER_AGENT: &str = concat!("ProjectManager/", env!("CARGO_PKG_VERSION"));
 pub struct Endpoints {
     web: Url,
     api: Url,
+    /// The upload host — GitHub serves binary release assets from there, not from `api`.
+    uploads: Url,
     https_only: bool,
     /// Shortest wait between device-flow polls (GitHub's documented minimum is 5 s).
     pub(crate) min_poll: Duration,
@@ -41,6 +43,7 @@ impl Endpoints {
         Endpoints {
             web: Url::parse("https://github.com").expect("static URL"),
             api: Url::parse("https://api.github.com").expect("static URL"),
+            uploads: Url::parse("https://uploads.github.com").expect("static URL"),
             https_only: true,
             min_poll: Duration::from_secs(5),
         }
@@ -52,7 +55,23 @@ impl Endpoints {
         let url = Url::parse(base).expect("test URL");
         Endpoints {
             web: url.clone(),
+            api: url.clone(),
+            uploads: url,
+            https_only: false,
+            min_poll: Duration::ZERO,
+        }
+    }
+
+    /// A local test server standing in for the API origin, with a separate uploads host —
+    /// pins that an asset upload goes to the uploads host, not the API host.
+    #[cfg(test)]
+    pub(crate) fn local_with_uploads(api: &str, uploads: &str) -> Self {
+        let url = Url::parse(api).expect("test URL");
+        let up = Url::parse(uploads).expect("test URL");
+        Endpoints {
+            web: url.clone(),
             api: url,
+            uploads: up,
             https_only: false,
             min_poll: Duration::ZERO,
         }
@@ -131,7 +150,11 @@ impl Client {
         if let Some(h) = self.http.get() {
             return Ok(h);
         }
-        let allowed = [self.endpoints.web.clone(), self.endpoints.api.clone()];
+        let allowed = [
+            self.endpoints.web.clone(),
+            self.endpoints.api.clone(),
+            self.endpoints.uploads.clone(),
+        ];
         let policy = redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
@@ -210,6 +233,97 @@ impl Client {
             .header(ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .header(AUTHORIZATION, format!("Bearer {}", token.expose()))
+            .send()
+            .map_err(|e| GitHubError::Network(describe(&e)))?;
+        let resp = self.check(resp)?;
+        let headers = resp.headers().clone();
+        let value = resp
+            .json()
+            .map_err(|e| GitHubError::Unexpected(format!("unreadable reply: {}", describe(&e))))?;
+        Ok(Reply { value, headers })
+    }
+
+    /// POST a JSON body (create a resource).
+    pub fn api_post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &Token,
+        body: &impl Serialize,
+    ) -> Result<Reply<T>, GitHubError> {
+        self.send_json(reqwest::Method::POST, path, token, body)
+    }
+
+    /// PATCH a JSON body (edit a resource).
+    pub fn api_patch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &Token,
+        body: &impl Serialize,
+    ) -> Result<Reply<T>, GitHubError> {
+        self.send_json(reqwest::Method::PATCH, path, token, body)
+    }
+
+    /// DELETE a resource. GitHub answers 204 No Content, so nothing is returned.
+    pub fn api_delete(&self, path: &str, token: &Token) -> Result<(), GitHubError> {
+        self.check_rate_limit()?;
+        let url = Self::url(&self.endpoints.api, path)?;
+        let resp = self
+            .http()?
+            .delete(url)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(AUTHORIZATION, format!("Bearer {}", token.expose()))
+            .send()
+            .map_err(|e| GitHubError::Network(describe(&e)))?;
+        let _ = self.check(resp)?;
+        Ok(())
+    }
+
+    /// POST raw bytes with the given content type (e.g. a release asset upload — GitHub
+    /// serves these from the uploads host, not the API host).
+    pub fn api_upload<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &Token,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<Reply<T>, GitHubError> {
+        self.check_rate_limit()?;
+        let url = Self::url(&self.endpoints.uploads, path)?;
+        let resp = self
+            .http()?
+            .post(url)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(AUTHORIZATION, format!("Bearer {}", token.expose()))
+            .header(CONTENT_TYPE, content_type)
+            .body(data.to_vec())
+            .send()
+            .map_err(|e| GitHubError::Network(describe(&e)))?;
+        let resp = self.check(resp)?;
+        let headers = resp.headers().clone();
+        let value = resp
+            .json()
+            .map_err(|e| GitHubError::Unexpected(format!("unreadable reply: {}", describe(&e))))?;
+        Ok(Reply { value, headers })
+    }
+
+    fn send_json<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        token: &Token,
+        body: &impl Serialize,
+    ) -> Result<Reply<T>, GitHubError> {
+        self.check_rate_limit()?;
+        let url = Self::url(&self.endpoints.api, path)?;
+        let resp = self
+            .http()?
+            .request(method, url)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(AUTHORIZATION, format!("Bearer {}", token.expose()))
+            .json(body)
             .send()
             .map_err(|e| GitHubError::Network(describe(&e)))?;
         let resp = self.check(resp)?;

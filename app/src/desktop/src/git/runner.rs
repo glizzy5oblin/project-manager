@@ -332,6 +332,9 @@ impl GitCommand {
 
     fn build(&self) -> Command {
         let mut cmd = Command::new(&self.program);
+        // Inside an AppImage, git and everything it runs (hooks, credential helpers) must not
+        // load the AppImage's bundled libraries.
+        crate::host_env::apply(&mut cmd);
         cmd.current_dir(&self.cwd)
             // Stable, parseable output with no pager, colour or path quoting.
             .args([

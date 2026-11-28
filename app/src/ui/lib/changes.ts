@@ -1,7 +1,9 @@
 // Pure helpers for the Changes view: the file rows, the selection as files move between lists,
 // and why a commit cannot be made yet.
 
+import type { Action } from "./bindings/Action";
 import type { ChangeKind } from "./bindings/ChangeKind";
+import type { Operation } from "./bindings/Operation";
 import type { StatusSummary } from "./bindings/StatusSummary";
 
 export type ChangeSide = "conflicted" | "staged" | "unstaged";
@@ -82,4 +84,50 @@ export function commitProblem(
     if (!message.trim()) return "Write a commit message";
     if (!amend && staged === 0) return "Stage some changes first";
     return null;
+}
+
+/** Continue and Abort for a cherry-pick, revert or rebase in progress; null for anything else. */
+export interface ReplayControls {
+    noun: string;
+    abort: Action;
+    /** The banner's sentence once no file is left in conflict. */
+    done: string;
+    continueHint: string;
+    abortHint: string;
+}
+
+export function replayControls(op: Operation | null): ReplayControls | null {
+    switch (op) {
+        case "cherryPick":
+            return {
+                noun: "cherry-pick",
+                abort: { type: "abortCherryPick" },
+                done: "Press Continue to commit the copied change.",
+                continueHint:
+                    "Commit the settled files with the copied commit's message",
+                abortHint:
+                    "Cancel the cherry-pick and go back to how things were before it started. A backup is taken first",
+            };
+        case "revert":
+            return {
+                noun: "revert",
+                abort: { type: "abortRevert" },
+                done: "Press Continue to commit the undo.",
+                continueHint: "Commit the settled files as the undo commit",
+                abortHint:
+                    "Cancel the revert and go back to how things were before it started. A backup is taken first",
+            };
+        case "rebase":
+            return {
+                noun: "rebase",
+                abort: { type: "abortRebase" },
+                done: "Press Continue to carry on with the remaining commits.",
+                continueHint:
+                    "Commit the settled files and replay the rest of your commits. It may stop again on a later one",
+                abortHint:
+                    "Cancel the rebase and put your branch back where it was. A backup is taken first",
+            };
+        default:
+            return null;
+    }
 }

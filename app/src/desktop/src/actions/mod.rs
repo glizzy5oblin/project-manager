@@ -14,11 +14,15 @@
 //! 5. The git commands run, each recorded in the [`OpLog`].
 
 mod hunks;
+mod interactive;
 mod oplog;
+mod remote;
+mod replay;
 mod stash;
 #[cfg(test)]
 mod tests;
 
+pub use interactive::{RebaseCommit, RebaseRange, TodoItem, TodoOp, rebase_range};
 pub use oplog::{CAPACITY as OP_LOG_CAPACITY, OpEntry, OpKind, OpLog};
 pub use stash::{StashEntry, list_stashes};
 
@@ -60,9 +64,11 @@ pub enum ResetMode {
     rename_all_fields = "camelCase"
 )]
 pub enum Keep {
-    /// The version on the branch you are on.
+    /// Your version: the branch you are on, or during a rebase your commit being replayed
+    /// (which git itself calls "theirs").
     Ours,
-    /// The version from the branch being merged in.
+    /// The other side's version: the branch being merged in, the commit being copied or
+    /// undone, or during a rebase the branch being rebased onto.
     Theirs,
     /// Remove the file.
     Delete,
@@ -142,6 +148,32 @@ pub enum Action {
         target: String,
         mode: ResetMode,
     },
+    /// Copy one commit (a revision) onto the current branch as a new commit.
+    CherryPick {
+        commit: String,
+    },
+    /// Add a commit that undoes `commit` (a revision on the current branch).
+    Revert {
+        commit: String,
+    },
+    /// Replay the current branch's own commits on top of `onto`, a branch or revision.
+    Rebase {
+        onto: String,
+    },
+    /// Rewrite the current branch's commits after `base` (all of them when `None`). `todo`
+    /// lists each of them once, oldest first, in the new order, with what happens to it.
+    RebaseInteractive {
+        base: Option<String>,
+        todo: Vec<TodoItem>,
+    },
+    /// Stop a cherry-pick that stopped on a conflict and go back to where it started.
+    AbortCherryPick,
+    /// Stop a revert that stopped on a conflict and go back to where it started.
+    AbortRevert,
+    /// Stop a rebase and put the branch back where it was.
+    AbortRebase,
+    /// Carry on with a cherry-pick, revert or rebase once its conflicts are settled.
+    Continue,
     /// Set uncommitted changes aside in a new stash. `staged_only` stashes just the staged ones.
     StashPush {
         message: Option<String>,
@@ -165,6 +197,26 @@ pub enum Action {
     },
     /// Delete every stash.
     StashClear,
+    /// Download new commits, branches and tags from `remote`, or from every remote when `None`.
+    Fetch {
+        remote: Option<String>,
+    },
+    /// Fetch the current branch's upstream and merge it in, or with `rebase`, replay the
+    /// branch's own commits on top of it.
+    Pull {
+        rebase: bool,
+    },
+    /// Send the current branch to its upstream, or to `remote` (its new upstream when it has
+    /// none). `force` replaces the remote branch, leased on the commit the preview saw there.
+    Push {
+        remote: Option<String>,
+        force: bool,
+    },
+    /// Send one tag to `remote`.
+    PushTag {
+        tag: String,
+        remote: String,
+    },
 }
 
 impl Action {
@@ -177,8 +229,15 @@ impl Action {
             Action::Commit { amend: true, .. } => Some("amend"),
             Action::DeleteBranch { .. } => Some("delete-branch"),
             Action::AbortMerge => Some("abort-merge"),
+            Action::Rebase { .. } => Some("rebase"),
+            Action::RebaseInteractive { .. } => Some("rebase-interactive"),
+            Action::AbortCherryPick => Some("abort-cherry-pick"),
+            Action::AbortRevert => Some("abort-revert"),
+            Action::AbortRebase => Some("abort-rebase"),
             Action::StashDrop { .. } => Some("stash-drop"),
             Action::StashClear => Some("stash-clear"),
+            Action::Pull { rebase: true } => Some("pull-rebase"),
+            Action::Push { force: true, .. } => Some("force-push"),
             Action::Reset { mode, .. } => Some(match mode {
                 ResetMode::Soft => "reset-soft",
                 ResetMode::Mixed => "reset-mixed",
@@ -195,9 +254,16 @@ impl Action {
             | Action::RenameBranch { .. }
             | Action::Checkout { .. }
             | Action::Merge { .. }
+            | Action::CherryPick { .. }
+            | Action::Revert { .. }
+            | Action::Continue
             | Action::StashPush { .. }
             | Action::StashApply { .. }
-            | Action::StashPop { .. } => None,
+            | Action::StashPop { .. }
+            | Action::Fetch { .. }
+            | Action::Pull { rebase: false }
+            | Action::Push { force: false, .. }
+            | Action::PushTag { .. } => None,
         }
     }
 
@@ -235,11 +301,25 @@ impl Action {
             Action::Merge { .. } => "merge",
             Action::AbortMerge => "abort-merge",
             Action::Reset { .. } => "reset",
+            Action::CherryPick { .. } => "cherry-pick",
+            Action::Revert { .. } => "revert",
+            Action::Rebase { .. } => "rebase",
+            Action::RebaseInteractive { .. } => "rebase-interactive",
+            Action::AbortCherryPick => "abort-cherry-pick",
+            Action::AbortRevert => "abort-revert",
+            Action::AbortRebase => "abort-rebase",
+            Action::Continue => "continue",
             Action::StashPush { .. } => "stash-push",
             Action::StashApply { .. } => "stash-apply",
             Action::StashPop { .. } => "stash-pop",
             Action::StashDrop { .. } => "stash-drop",
             Action::StashClear => "stash-clear",
+            Action::Fetch { .. } => "fetch",
+            Action::Pull { rebase: false } => "pull",
+            Action::Pull { rebase: true } => "pull-rebase",
+            Action::Push { force: false, .. } => "push",
+            Action::Push { force: true, .. } => "force-push",
+            Action::PushTag { .. } => "push-tag",
         }
     }
 }
@@ -268,16 +348,28 @@ pub struct ActionOutcome {
     pub title: String,
     /// Taken before a dangerous action; restoring it undoes the action.
     pub backup: Option<BackupRecord>,
-    /// Files left with conflicts when a merge stopped on them. The merge is then in progress:
-    /// resolve and commit, or abort it.
+    /// Files left with conflicts when a merge, cherry-pick, revert or rebase stopped on them.
+    /// It is then in progress: settle the files and commit or continue, or abort it.
     pub conflicts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     /// The user confirmed running git in a repository owned by someone else.
     pub allow_untrusted: bool,
+    /// Take a backup before dangerous and auto-backup actions.
+    pub backups: bool,
     pub backup: BackupOptions,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        RunOptions {
+            allow_untrusted: false,
+            backups: true,
+            backup: BackupOptions::default(),
+        }
+    }
 }
 
 /// A repository that actions run in.
@@ -535,14 +627,10 @@ impl Repo {
         })
     }
 
+    /// Refuse `what` while a merge, cherry-pick, revert, rebase or other operation is in
+    /// progress.
     fn require_no_merge(&self, what: &str) -> Result<(), AppError> {
-        if self.merging()? {
-            Err(AppError::invalid(format!(
-                "A merge is in progress: commit or abort it before {what}"
-            )))
-        } else {
-            Ok(())
-        }
+        self.require_idle(what)
     }
 }
 
@@ -680,9 +768,16 @@ fn plan_resolve(repo: &Repo, path: &str, keep: &Keep) -> Result<Plan, AppError> 
             .step(repo.git().args(["checkout", flag, "--", path]))
             .step(repo.git().args(["add", "--", path])))
     };
+    // During a rebase git's "ours" is the branch being rebased onto; turn it round.
+    let rebasing = repo.in_progress()? == Some(replay::InProgress::Rebase);
+    let (mine, theirs) = if rebasing {
+        ((2, "--theirs"), (1, "--ours"))
+    } else {
+        ((1, "--ours"), (2, "--theirs"))
+    };
     match keep {
-        Keep::Ours => side(1, "your", "--ours"),
-        Keep::Theirs => side(2, "their", "--theirs"),
+        Keep::Ours => side(mine.0, "your", mine.1),
+        Keep::Theirs => side(theirs.0, "their", theirs.1),
         Keep::Delete => Ok(Plan::new(format!("Delete {path}"))
             .impact("The file is removed")
             .step(repo.git().args(["rm", "-q", "--", path]))),
@@ -812,6 +907,16 @@ fn plan(repo: &Repo, action: &Action) -> Result<Plan, AppError> {
                 .step(repo.git().args(["merge", "--abort"])))
         }
         Action::Reset { target, mode } => plan_reset(repo, target, *mode),
+        Action::CherryPick { commit } => replay::plan_cherry_pick(repo, commit),
+        Action::Revert { commit } => replay::plan_revert(repo, commit),
+        Action::Rebase { onto } => replay::plan_rebase(repo, onto),
+        Action::RebaseInteractive { base, todo } => {
+            interactive::plan_rebase_interactive(repo, base.as_deref(), todo)
+        }
+        Action::AbortCherryPick => replay::plan_abort(repo, replay::InProgress::CherryPick),
+        Action::AbortRevert => replay::plan_abort(repo, replay::InProgress::Revert),
+        Action::AbortRebase => replay::plan_abort(repo, replay::InProgress::Rebase),
+        Action::Continue => replay::plan_continue(repo),
         Action::StashPush {
             message,
             include_untracked,
@@ -821,6 +926,10 @@ fn plan(repo: &Repo, action: &Action) -> Result<Plan, AppError> {
         Action::StashPop { stash, index } => stash::plan_apply(repo, stash, *index, true),
         Action::StashDrop { stash } => stash::plan_drop(repo, stash),
         Action::StashClear => stash::plan_clear(repo),
+        Action::Fetch { remote } => remote::plan_fetch(repo, remote.as_deref()),
+        Action::Pull { rebase } => remote::plan_pull(repo, *rebase),
+        Action::Push { remote, force } => remote::plan_push(repo, remote.as_deref(), *force),
+        Action::PushTag { tag, remote } => remote::plan_push_tag(repo, tag, remote),
     }
 }
 
@@ -1055,6 +1164,9 @@ fn fingerprint(repo: &Repo, action: &Action) -> Result<String, AppError> {
         &["symbolic-ref", "-q", "HEAD"][..],
         &["rev-parse", "-q", "--verify", "HEAD"],
         &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"],
+        &["rev-parse", "-q", "--verify", "REVERT_HEAD"],
+        &["rev-parse", "-q", "--verify", "REBASE_HEAD"],
         &[
             "for-each-ref",
             "--format=%(objectname) %(refname)",
@@ -1122,22 +1234,28 @@ pub fn run(
             if cancel.is_cancelled() {
                 return Err(AppError::new(ErrorKind::Cancelled, "Cancelled"));
             }
-            let started = Instant::now();
-            let result =
-                Backups::open(repo.root()).and_then(|b| b.create(backup_action, &opts.backup));
-            match result {
-                Ok(record) => {
-                    log.backup(&repo.label(), name, Ok(&record.id), started.elapsed());
-                    Some(record)
-                }
-                Err(e) => {
-                    log.backup(&repo.label(), name, Err(e.to_string()), started.elapsed());
-                    let mut err = AppError::from(e);
-                    err.message = format!(
-                        "No backup could be taken, so \"{}\" did not run: {}",
-                        plan.title, err.message
-                    );
-                    return Err(err);
+            if !opts.backups {
+                // Confirmation and cancellation above are kept: they gate the run,
+                // not the backup.
+                None
+            } else {
+                let started = Instant::now();
+                let result =
+                    Backups::open(repo.root()).and_then(|b| b.create(backup_action, &opts.backup));
+                match result {
+                    Ok(record) => {
+                        log.backup(&repo.label(), name, Ok(&record.id), started.elapsed());
+                        Some(record)
+                    }
+                    Err(e) => {
+                        log.backup(&repo.label(), name, Err(e.to_string()), started.elapsed());
+                        let mut err = AppError::from(e);
+                        err.message = format!(
+                            "No backup could be taken, so \"{}\" did not run: {}",
+                            plan.title, err.message
+                        );
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -1166,8 +1284,15 @@ pub fn run(
                     break;
                 }
             }
-            let err = out.into_result().expect_err("the command failed");
-            return Err(after_backup(err.into(), &backup));
+            let mut err: AppError = out.into_result().expect_err("the command failed").into();
+            if let Some(m) = err
+                .detail
+                .as_deref()
+                .and_then(|d| remote::rejection(action, d))
+            {
+                err.message = m;
+            }
+            return Err(after_backup(err, &backup));
         }
     }
     Ok(ActionOutcome {

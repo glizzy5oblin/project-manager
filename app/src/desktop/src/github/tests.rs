@@ -433,6 +433,35 @@ fn redirects_off_github_are_refused() {
 }
 
 #[test]
+fn an_upload_goes_to_the_uploads_origin_not_the_api_origin() {
+    let api = Server::start(Vec::new());
+    let uploads = Server::start(vec![json(
+        201,
+        serde_json::json!({"id": 42, "name": "asset.zip"}),
+    )]);
+    let client = Client::new(Endpoints::local_with_uploads(&api.base, &uploads.base));
+    let token = Token::new(SECRET).unwrap();
+
+    let reply = client
+        .api_upload::<serde_json::Value>(
+            "/repos/example/example/releases/1/assets?name=asset.zip",
+            &token,
+            "application/octet-stream",
+            b"zip-bytes",
+        )
+        .unwrap();
+
+    assert_eq!(reply.value["id"], 42);
+    assert!(
+        api.requests().is_empty(),
+        "the API origin must not see the upload"
+    );
+    let requests = uploads.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, "zip-bytes");
+}
+
+#[test]
 fn same_origin_redirect_is_followed() {
     let server = Server::start_with(|base| {
         vec![
